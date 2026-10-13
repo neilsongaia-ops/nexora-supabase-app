@@ -1,0 +1,1704 @@
+// Modo demonstração: implementação local de api() com dados 100% fictícios e coerentes (formatos de docs/API.md).
+import { isoLocal, addDays, addMonths, diffDays, r2, sleep, monthStart, monthEnd } from './util.js';
+
+const T = isoLocal(new Date());
+const KEY = 'nx.demo.v12', FK = 'nx.demo.flags';
+const sget = (k) => { try { return JSON.parse(sessionStorage.getItem(k)); } catch { return null; } };
+const sset = (k, v) => { try { sessionStorage.setItem(k, JSON.stringify(v)); } catch { /* cheio */ } };
+const flags = Object.assign({ lento: false, falhar: false, conflito: false, expirar: false, offline: false, semBanco: false, vazio: false, contaNova: false }, sget(FK) || {});
+if (new URLSearchParams(location.search).get('lento') === '1') flags.lento = true;
+export const getFlags = () => ({ ...flags });
+export function setFlag(k, v) { flags[k] = v; sset(FK, flags); }
+// Perfil pessoal (Fase 7): fica fora de DB.usuario para nunca sair no bootstrap
+const PERFIL_EX = { cpf: '52998224725', telefone: '91988887777', nascimento: '', avatar: null };
+export function setPerfil(kind) {
+  if (!DB) seed();
+  DB.perfil = kind === 'vazio' ? { cpf: '', telefone: '', nascimento: '', avatar: null } : { ...PERFIL_EX };
+  save();
+}
+export function setDesloc(kind) {
+  if (!DB) seed();
+  DB.desl ||= {};
+  const k = DB.usuario.id;
+  if (kind === 'vazio') { DB.desl[k] = { enderecos: [], veiculos: [], combustiveis: {}, modos: [], migrado: true }; DB.spaces.forEach((s) => { s.config.casa_latitude = null; s.config.casa_longitude = null; }); }
+  else if (kind === 'migrar') { delete DB.desl[k]; DB.spaces.forEach((s) => { s.config.casa_latitude = -1.4552; s.config.casa_longitude = -48.4883; s.config.custo_km = s.config.custo_km || 0.95; }); }
+  else DB.desl[k] = seedDesl();
+  save();
+}
+export function resetDemo() { sessionStorage.removeItem(KEY); DB = null; flags.contaNova = false; sset(FK, flags); }
+
+let DB = sget(KEY);
+const save = () => sset(KEY, DB);
+const clone = (x) => (x === undefined ? null : JSON.parse(JSON.stringify(x)));
+const pad = (n) => String(n).padStart(2, '0');
+const nid = (p) => p + (++DB.seq).toString(36);
+const fail = (msg, codigo = '') => { const e = new Error(msg); e.codigo = codigo; throw e; };
+const norm = (s) => String(s || '').normalize('NFD').replace(/\p{Diacritic}/gu, '').toLowerCase();
+const now = () => new Date().toISOString().slice(0, 19);
+const PAPEL_TXT = { leitura: 'leitura', editor: 'editor', admin: 'administrador' };
+/* Tipos de aviso configuráveis (convite e papel são sempre entregues e não entram aqui). */
+const PREF_TIPOS = [
+  { tipo: 'LANCAMENTO_MEMBRO', titulo: 'Lançamentos de outras pessoas', descricao: 'Quando alguém do espaço lança uma receita ou despesa.' },
+  { tipo: 'FATURA_VENCENDO', titulo: 'Fatura perto de vencer', descricao: 'Até 3 dias antes do vencimento.' },
+  { tipo: 'PLANEJAMENTO_80', titulo: 'Planejamento em 80%', descricao: 'Quando um planejamento chega a 80% do limite ou da meta.' },
+  { tipo: 'PLANEJAMENTO_100', titulo: 'Planejamento em 100%', descricao: 'Quando um planejamento atinge o limite ou bate a meta.' },
+  { tipo: 'CHEQUE_ESPECIAL', titulo: 'Cheque especial', descricao: 'Quando uma conta usa 80% ou 100% do cheque especial, ou fica acima do limite.' },
+  { tipo: 'QUEDA_PRECO', titulo: 'Queda de preço', descricao: 'Produto que você compra 10% mais barato em outra loja.' },
+];
+const prefsDe = () => DB.prefsNotif || (DB.prefsNotif = {});
+const prefsView = () => ({ tipos: PREF_TIPOS.map((t) => ({ ...t, ativo: prefsDe()[t.tipo] !== false })) });
+/* Fila de notificações da PESSOA logada (no demo, só Ana tem feed local). */
+function notificar(email, n) {
+  if (!DB.notificacoes || email !== DB.usuario.email) return null;
+  if (prefsDe()[n.tipo] === false) return null;
+  const item = { id: nid('nt'), lida: false, ref_id: null, espaco_id: null, criada_em: now(), ...n };
+  DB.notificacoes.unshift(item);
+  return item;
+}
+function rng(seed) { return () => { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const gtin = (b12) => { let s = 0; for (let i = 0; i < 12; i++) s += Number(b12[11 - i]) * (i % 2 === 0 ? 3 : 1); return b12 + String((10 - (s % 10)) % 10); };
+const cpfOk = (c) => {
+  if (!/^\d{11}$/.test(c) || /^(\d)\1{10}$/.test(c)) return false;
+  const dv = (n) => { let t = 0; for (let i = 0; i < n; i++) t += Number(c[i]) * (n + 1 - i); const r = (t * 10) % 11; return r === 10 ? 0 : r; };
+  return dv(9) === Number(c[9]) && dv(10) === Number(c[10]);
+};
+const perfilDe = () => DB.perfil || (DB.perfil = { ...PERFIL_EX });
+const perfilView = () => { const pf = perfilDe(), c = pf.cpf; return { nome: DB.usuario.nome, email: DB.usuario.email, cpf_mascarado: c ? '***.' + c.slice(3, 6) + '.' + c.slice(6, 9) + '-**' : '', tem_cpf: !!c, telefone: pf.telefone || '', nascimento: pf.nascimento || '', avatar: pf.avatar || null }; };
+const dv11 = (s) => { let w = 2, t = 0; for (let i = s.length - 1; i >= 0; i--) { t += Number(s[i]) * w; w = w === 9 ? 2 : w + 1; } const r = t % 11; return r < 2 ? 0 : 11 - r; };
+
+// ---------- categorias ----------
+const CATS = [
+  ['c_alim', 'Alimentação', 'DESPESA'], ['c_merc', 'Mercado', 'DESPESA', 'c_alim'], ['c_rest', 'Restaurantes', 'DESPESA', 'c_alim'], ['c_pada', 'Padaria e lanches', 'DESPESA', 'c_alim'],
+  ['c_mor', 'Moradia', 'DESPESA'], ['c_alug', 'Aluguel', 'DESPESA', 'c_mor'], ['c_ener', 'Energia', 'DESPESA', 'c_mor'], ['c_agua', 'Água', 'DESPESA', 'c_mor'], ['c_net', 'Internet e telefone', 'DESPESA', 'c_mor'], ['c_cond', 'Condomínio', 'DESPESA', 'c_mor'],
+  ['c_transp', 'Transporte', 'DESPESA'], ['c_comb', 'Combustível', 'DESPESA', 'c_transp'], ['c_app', 'Aplicativos de transporte', 'DESPESA', 'c_transp'], ['c_manut', 'Manutenção do carro', 'DESPESA', 'c_transp'],
+  ['c_saude', 'Saúde', 'DESPESA'], ['c_farm', 'Farmácia', 'DESPESA', 'c_saude'], ['c_plano', 'Plano de saúde', 'DESPESA', 'c_saude'],
+  ['c_edu', 'Educação', 'DESPESA'], ['c_lazer', 'Lazer', 'DESPESA'], ['c_casa', 'Casa e utilidades', 'DESPESA'], ['c_limp', 'Limpeza', 'DESPESA', 'c_casa'],
+  ['c_pets', 'Pets', 'DESPESA'], ['c_vest', 'Vestuário', 'DESPESA'], ['c_assin', 'Assinaturas', 'DESPESA'], ['c_pres', 'Presentes', 'DESPESA'], ['c_tarifa', 'Impostos e tarifas', 'DESPESA'], ['c_hig', 'Higiene e beleza', 'DESPESA'],
+  ['c_sal', 'Salário', 'RECEITA'], ['c_free', 'Trabalhos extras', 'RECEITA'], ['c_rend', 'Rendimentos', 'RECEITA'], ['c_reemb', 'Reembolsos', 'RECEITA'], ['c_vendas', 'Vendas', 'RECEITA'],
+];
+const baseSpace = (id, nome, papel) => ({
+  id, nome, papel,
+  categorias: CATS.map(([cid, n, tipo, pai]) => ({ id: cid, nome: n, tipo, pai_id: pai || null, status: 'ATIVA' })),
+  recursos: [], lancamentos: [], pagamentos: [], recorrencias: [], planejamentos: [], produtos: [], lojas: [], precos: [], listas: [], listaItens: [], sessoes: [], notas: [], apelidos: {}, auditoria: [],
+  membros: [{ usuario_id: 'u_ana', email: 'ana.prado@exemplo.com', nome: 'Ana Prado', papel: papel === 'leitura' ? 'leitura' : 'admin' }],
+  config: { compartilhar_precos: true, custo_km: 0.95, fator_rota: 1.3, casa_latitude: -1.4552, casa_longitude: -48.4883 },
+});
+
+// ---------- motor financeiro ----------
+const recOf = (S, id) => S.recursos.find((r) => r.id === id);
+const closing = (k, ym) => { const [y, m] = ym.split('-').map(Number); return `${ym}-${pad(Math.min(k.dia_fechamento, new Date(y, m, 0).getDate()))}`; };
+const due = (k, ym) => { let m = ym; if (k.dia_vencimento <= k.dia_fechamento) m = addMonths(ym + '-01', 1).slice(0, 7); const [y, mm] = m.split('-').map(Number); return `${m}-${pad(Math.min(k.dia_vencimento, new Date(y, mm, 0).getDate()))}`; };
+const ymAdd = (ym, n) => addMonths(ym + '-01', n).slice(0, 7);
+function faturaYm(k, data, retro) {
+  let ym = data.slice(0, 7); const day = Number(data.slice(8, 10));
+  if (day > k.dia_fechamento || (day === k.dia_fechamento && k.regra_fechamento === 'EXCLUSIVO')) ym = ymAdd(ym, 1);
+  if (retro) while (closing(k, ym) < T) ym = ymAdd(ym, 1);
+  return ym;
+}
+function faturasDe(S, kid) {
+  const k = recOf(S, kid), map = new Map();
+  const get = (ym) => {
+    if (!map.has(ym)) { const f = closing(k, ym); map.set(ym, { id: `${kid}~${ym}`, recurso_id: kid, periodo_inicio: addDays(closing(k, ymAdd(ym, -1)), 1), periodo_fim: f, data_fechamento: f, data_vencimento: due(k, ym), parcelas: [], pagamentos: [] }); }
+    return map.get(ym);
+  };
+  for (const l of S.lancamentos) for (const p of l.parcelas || []) {
+    if (p.status === 'CANCELADA' || !p.fatura_id.startsWith(kid + '~')) continue;
+    get(p.fatura_id.split('~')[1]).parcelas.push({ id: p.id, lancamento_id: l.id, descricao: l.descricao, numero: p.numero, total: p.total, valor: p.valor, data_compra: l.data_evento, credito: p.valor < 0 });
+  }
+  for (const pg of S.pagamentos) if (pg.fatura_id.startsWith(kid + '~')) get(pg.fatura_id.split('~')[1]).pagamentos.push(pg);
+  get(faturaYm(k, T, true));
+  return [...map.values()].map((f) => {
+    const total = r2(f.parcelas.reduce((s, p) => s + p.valor, 0)), pago = r2(f.pagamentos.reduce((s, p) => s + p.valor, 0));
+    let status;
+    if (f.data_fechamento >= T) status = 'ABERTA';
+    else if (pago >= total - 0.004) status = 'PAGA';
+    else if (f.data_vencimento < T) status = 'VENCIDA';
+    else if (pago > 0) status = 'PARCIALMENTE_PAGA';
+    else status = 'FECHADA';
+    return { ...f, valor_total: total, valor_pago: pago, valor_em_aberto: r2(Math.max(0, total - pago)), status };
+  }).filter((f) => f.status === 'ABERTA' || f.valor_total !== 0).sort((a, b) => (a.data_fechamento < b.data_fechamento ? 1 : -1));
+}
+const resumoFat = ({ parcelas, pagamentos, ...f }) => f;
+function saldo(S, id, { proj = false, ate = T } = {}) {
+  let s = 0;
+  for (const l of S.lancamentos) {
+    if (l.status === 'CANCELADO') continue;
+    const eff = l.status === 'EFETIVADO' || l.status === 'ESTORNADO';
+    if (!eff && !proj) continue;
+    for (const m of l.movimentacoes) {
+      if (m.recurso_id !== id) continue;
+      if (!proj && (m.data_efetivacao || l.data_evento) > ate) continue;
+      s += m.natureza === 'CREDITO' ? m.valor : -m.valor;
+    }
+  }
+  return r2(s);
+}
+function situacaoCartao(S, kid) {
+  const k = recOf(S, kid), sal = saldo(S, kid, { ate: '9999-12-31' }), fs = faturasDe(S, kid);
+  const comp = r2(Math.max(0, -sal));
+  return {
+    recurso_id: kid, nome: k.nome, limite: k.limite || 0, limite_comprometido: comp, limite_disponivel: r2(Math.max(0, (k.limite || 0) - comp)), credito_a_favor: r2(Math.max(0, sal)),
+    fatura_aberta: resumoFat(fs.find((f) => f.status === 'ABERTA') || {}),
+    faturas_a_pagar: fs.filter((f) => ['FECHADA', 'VENCIDA', 'PARCIALMENTE_PAGA'].includes(f.status)).map(resumoFat),
+  };
+}
+function splitCents(total, n) { const c = Math.round(total * 100), b = Math.floor(c / n); return Array.from({ length: n }, (_, i) => (b + (i < c - b * n ? 1 : 0)) / 100); }
+function parcelar(S, l, retro) {
+  const k = recOf(S, l.recurso_id);
+  if (!k || k.tipo !== 'CARTAO' || l.tipo !== 'SAIDA') return;
+  const n = l.parcelas_total || 1, base = faturaYm(k, l.data_evento, retro);
+  l.parcelas = splitCents(l.valor_total, n).map((v, i) => ({ id: nid('pc'), numero: i + 1, total: n, valor: v, fatura_id: `${k.id}~${ymAdd(base, i)}`, status: 'ATIVA' }));
+}
+function movs(l) {
+  const eff = l.status === 'EFETIVADO' ? (l.data_efetivacao || l.data_evento) : null;
+  const m = (recurso_id, natureza) => ({ id: nid('m'), recurso_id, natureza, valor: l.valor_total, data_efetivacao: eff });
+  if (l.tipo === 'ENTRADA') return [m(l.recurso_id, 'CREDITO')];
+  if (l.tipo === 'SAIDA') return [m(l.recurso_id, 'DEBITO')];
+  return [m(l.origem_id, 'DEBITO'), m(l.destino_id, 'CREDITO')];
+}
+function audit(S, id, acao, mudancas = {}, quando = now()) { S.auditoria.push({ entidade_id: id, quando, quem: DB.usuario.nome || DB.usuario.email, acao, mudancas }); }
+
+function criarLanc(S, p, { origem = 'MANUAL', retro = true, seed = false } = {}) {
+  const tipo = p.tipo;
+  if (!['ENTRADA', 'SAIDA', 'TRANSFERENCIA'].includes(tipo)) fail('Escolha entrada, saída ou transferência.');
+  const bruto = r2(p.valor_bruto);
+  if (!(bruto > 0)) fail('Informe um valor maior que zero.');
+  if (!String(p.descricao || '').trim()) fail('Informe a descrição.');
+  const desc = r2(p.descontos), acr = r2(p.acrescimos), enc = r2(p.encargos), total = r2(bruto - desc + acr + enc);
+  if (total <= 0) fail('O total precisa ser maior que zero.');
+  const data = (p.data_evento || T).slice(0, 10);
+  let status = p.status || (data > T ? 'PLANEJADO' : 'EFETIVADO');
+  if (status === 'EFETIVADO' && data > T) status = 'PLANEJADO';
+  const l = { id: nid('l'), tipo, status, origem, data_evento: data, descricao: String(p.descricao).trim(), valor_bruto: bruto, descontos: desc, acrescimos: acr, encargos: enc, valor_total: total,
+    categoria_id: tipo === 'TRANSFERENCIA' ? null : p.categoria_id || null, recurso_id: null, origem_id: null, destino_id: null, parcelas_total: 1, versao: 1,
+    criado_em: seed ? data + 'T' + pad(8 + (DB.seq % 12)) + ':' + pad(DB.seq % 60) + ':00' : now(), recorrencia_id: p.recorrencia_id || null, fatura_id: p.fatura_id || null, estorno_de: null, estornado_por: null, motivo_estorno: null, itens: [], parcelas: [], movimentacoes: [] };
+  if (tipo === 'TRANSFERENCIA') {
+    const o = recOf(S, p.origem_id), d = recOf(S, p.destino_id);
+    if (!o || !d) fail('Escolha a origem e o destino.');
+    if (o.id === d.id) fail('Origem e destino precisam ser diferentes.');
+    l.origem_id = o.id; l.destino_id = d.id;
+  } else {
+    const r = recOf(S, p.recurso_id);
+    if (!r) fail(tipo === 'SAIDA' ? 'Escolha de onde sai o dinheiro.' : 'Escolha para onde vai o dinheiro.');
+    if (r.status === 'INATIVO') fail('Este recurso está inativo.');
+    if (tipo === 'ENTRADA' && r.tipo === 'CARTAO' && origem !== 'ESTORNO') fail('Entradas não vão para cartão.');
+    l.recurso_id = r.id;
+    if (r.tipo === 'CARTAO' && tipo === 'SAIDA') l.parcelas_total = Math.max(1, Math.min(48, Number(p.parcelas) || 1));
+  }
+  if (p.cobranca_banco && !(tipo === 'SAIDA' && (recOf(S, l.recurso_id) || {}).tipo === 'CONTA')) fail('"Cobrança do banco" vale só para saída de conta.');
+  l.cobranca_banco = !!p.cobranca_banco;
+  if (p.itens && p.itens.length) {
+    l.itens = p.itens.map((i) => {
+      const q = Number(i.quantidade) || 1, vt = r2(i.valor_total != null ? i.valor_total : q * (Number(i.valor_unitario) || 0));
+      return { id: nid('it'), descricao: String(i.descricao || '').trim() || 'Item', quantidade: q, valor_unitario: r2(i.valor_unitario != null ? i.valor_unitario : vt / q), valor_total: vt, categoria_id: i.categoria_id || l.categoria_id, produto_id: i.produto_id || null };
+    });
+    const soma = r2(l.itens.reduce((s, i) => s + i.valor_total, 0));
+    if (Math.abs(soma - bruto) > 0.009) fail('A soma dos itens (' + soma.toFixed(2).replace('.', ',') + ') precisa ser igual ao valor.');
+  }
+  if (status === 'EFETIVADO') { l.data_efetivacao = data; parcelar(S, l, retro); }
+  l.movimentacoes = movs(l);
+  S.lancamentos.push(l);
+  if (!seed) audit(S, l.id, 'criado');
+  return l;
+}
+const findL = (S, id) => S.lancamentos.find((l) => l.id === id) || fail('Lançamento não encontrado.');
+function viewL(S, l, full = false) {
+  const v = clone(l);
+  v.movimentacoes = l.movimentacoes.map((m) => ({ recurso_id: m.recurso_id, natureza: m.natureza, valor: m.valor, data_efetivacao: m.data_efetivacao }));
+  if (full) v.execucoes = execucoes(S, l);
+  return v;
+}
+
+// consumo para categorias e planejamentos
+const ancestors = (S, cid) => { const out = []; let c = S.categorias.find((x) => x.id === cid); while (c) { out.push(c.id); c = c.pai_id && S.categorias.find((x) => x.id === c.pai_id); } return out; };
+const rootCat = (S, cid) => { const a = ancestors(S, cid); return a[a.length - 1] || null; };
+function linhasConsumo(S, de, ate) {
+  const out = [];
+  for (const l of S.lancamentos) {
+    if (l.data_evento < de || l.data_evento > ate) continue;
+    let sign = 0;
+    if (l.tipo === 'SAIDA' && (l.status === 'EFETIVADO' || l.status === 'ESTORNADO') && l.origem !== 'ESTORNO') sign = 1;
+    if (l.origem === 'ESTORNO' && l.tipo === 'ENTRADA') sign = -1;
+    if (!sign) continue;
+    const consumo = l.valor_bruto - l.descontos + l.acrescimos;
+    if (l.itens.length) l.itens.forEach((i) => out.push({ l, categoria_id: i.categoria_id, valor: sign * i.valor_total * consumo / l.valor_bruto, data: l.data_evento }));
+    else out.push({ l, categoria_id: l.categoria_id, valor: sign * consumo, data: l.data_evento });
+  }
+  return out;
+}
+function linhasReceita(S, de, ate) {
+  const out = [];
+  for (const l of S.lancamentos) {
+    if (l.data_evento < de || l.data_evento > ate) continue;
+    let sign = 0;
+    if (l.tipo === 'ENTRADA' && (l.status === 'EFETIVADO' || l.status === 'ESTORNADO') && !['ESTORNO', 'SALDO_INICIAL'].includes(l.origem)) sign = 1;
+    if (l.origem === 'ESTORNO' && l.tipo === 'SAIDA') sign = -1;
+    if (!sign) continue;
+    out.push({ l, categoria_id: l.categoria_id, valor: sign * l.valor_total, data: l.data_evento });
+  }
+  return out;
+}
+function planDe(S, linha, tipo = 'SAIDA') {
+  const anc = ancestors(S, linha.categoria_id);
+  let best = null;
+  for (const p of S.planejamentos) {
+    if ((p.tipo || 'SAIDA') !== tipo) continue;
+    if (p.status !== 'ATIVO' || linha.data < p.data_inicio || (p.data_fim && linha.data > p.data_fim)) continue;
+    const pc = p.categorias.find((c) => anc.includes(c.categoria_id));
+    if (pc && (!best || p.prioridade < best.p.prioridade)) best = { p, pc };
+  }
+  return best;
+}
+const vigenteP = (p) => p.data_inicio <= T && (!p.data_fim || p.data_fim >= T);
+const fimPeriodo = (ini, r) => {
+  const n = r.intervalo || 1;
+  if (r.periodicidade === 'MENSAL') return addDays(addMonths(ini, n), -1);
+  if (r.periodicidade === 'ANUAL') return addDays(addMonths(ini, 12 * n), -1);
+  if (r.periodicidade === 'SEMANAL') return addDays(ini, 7 * n - 1);
+  return addDays(ini, n - 1);
+};
+function situacaoPlan(S, p) {
+  const tipo = p.tipo || 'SAIDA';
+  const cats = p.categorias.map((c) => ({ categoria_id: c.categoria_id, nome: (S.categorias.find((x) => x.id === c.categoria_id) || {}).nome || '', limite: c.valor_limite || 0, percentual_execucao: c.percentual_execucao || 100, realizado: 0 }));
+  const linhas = tipo === 'ENTRADA' ? linhasReceita(S, p.data_inicio, p.data_fim || '9999-12-31') : linhasConsumo(S, p.data_inicio, p.data_fim || '9999-12-31');
+  for (const ln of linhas) {
+    const b = planDe(S, ln, tipo);
+    if (b && b.p.id === p.id) { const c = cats.find((x) => x.categoria_id === b.pc.categoria_id); c.realizado += ln.valor * (b.pc.percentual_execucao || 100) / 100; }
+  }
+  cats.forEach((c) => { c.realizado = r2(c.realizado); c.disponivel = r2(Math.max(0, c.limite - c.realizado)); c.excedido = r2(Math.max(0, c.realizado - c.limite)); });
+  const real = r2(cats.reduce((s, c) => s + c.realizado, 0));
+  const rc = p.recorrencia || null;
+  const prox = rc && rc.status === 'ATIVA' && p.data_fim ? addDays(p.data_fim, 1) : null;
+  return { id: p.id, nome: p.nome, tipo, data_inicio: p.data_inicio, data_fim: p.data_fim, prioridade: p.prioridade, status: p.status, versao: p.versao,
+    vigente: vigenteP(p), serie_id: p.serie_id || null,
+    recorrencia: rc ? { status: rc.status, periodicidade: rc.periodicidade, intervalo: rc.intervalo || 1, ate: rc.ate || null, proximo_inicio: prox && (!rc.ate || prox <= rc.ate) ? prox : null } : null,
+    planejado: p.valor_limite, realizado: real, disponivel: r2(Math.max(0, p.valor_limite - real)), excedido: r2(Math.max(0, real - p.valor_limite)),
+    percentual: p.valor_limite ? Math.round(real / p.valor_limite * 1000) / 10 : 0, meta_atingida: tipo === 'ENTRADA' && real >= p.valor_limite, categorias: cats };
+}
+function execucoes(S, l) {
+  const out = [];
+  for (const ln of linhasConsumo(S, '0000', '9999').filter((x) => x.l.id === l.id)) { const b = planDe(S, ln); if (b) out.push({ planejamento_id: b.p.id, nome: b.p.nome, categoria_id: b.pc.categoria_id, valor: r2(ln.valor * (b.pc.percentual_execucao || 100) / 100) }); }
+  return out;
+}
+
+// recorrências
+function ocorrencias(r, ate) {
+  const out = []; let d = r.data_inicial, i = 0;
+  const fim = r.data_final && r.data_final < ate ? r.data_final : ate;
+  while (d <= fim && i < 500) {
+    out.push(d); i++;
+    if (r.periodicidade === 'DIARIA') d = addDays(r.data_inicial, i);
+    else if (r.periodicidade === 'SEMANAL') d = addDays(r.data_inicial, 7 * i);
+    else if (r.periodicidade === 'A_CADA_N_DIAS') d = addDays(r.data_inicial, (r.intervalo || 1) * i);
+    else if (r.periodicidade === 'ANUAL') d = addMonths(r.data_inicial, 12 * i);
+    else d = addMonths(r.data_inicial, i);
+  }
+  return out;
+}
+function gerarRec(S, ate, seedPast = false) {
+  let n = 0;
+  for (const r of S.recorrencias) {
+    if (r.status !== 'ATIVA') continue;
+    for (const d of ocorrencias(r, ate)) {
+      if (r.gerados.includes(d)) continue;
+      r.gerados.push(d);
+      const st = seedPast && d <= T ? 'EFETIVADO' : d <= T ? 'PENDENTE' : 'PLANEJADO';
+      criarLanc(S, { tipo: r.tipo_lancamento, descricao: r.descricao, valor_bruto: r.valor, data_evento: d, status: st, recurso_id: r.recurso_id, origem_id: r.recurso_id, destino_id: r.recurso_destino_id, categoria_id: r.categoria_id, recorrencia_id: r.id, cobranca_banco: !!r.cobranca_banco }, { origem: 'RECORRENCIA', retro: false, seed: seedPast });
+      n++;
+    }
+  }
+  return n;
+}
+function pagarFatura(S, f, contaId, valor, data, seed) {
+  const k = recOf(S, f.recurso_id);
+  const l = criarLanc(S, { tipo: 'TRANSFERENCIA', descricao: 'Pagamento da fatura · ' + k.nome, valor_bruto: valor, data_evento: data, status: 'EFETIVADO', origem_id: contaId, destino_id: k.id, fatura_id: f.id }, { origem: 'PAGAMENTO_FATURA', seed });
+  if (!seed) chequeConferir(S, l);
+  S.pagamentos.push({ id: nid('pg'), fatura_id: f.id, valor: r2(valor), data, recurso_id: contaId, lancamento_id: l.id });
+  return l;
+}
+
+// ---------- produtos e preços ----------
+// embalagem = número na unidade do produto (como no backend): "500 g" → { unidade: 'G', tam: 500 }; "1 L" → { 'ML', 1000 }; produto vendido por KG/L mantém a unidade
+const tamNum = (v) => { const n = Number(String(v ?? '').replace(',', '.')); return n > 0 ? n : null; };
+function tamUn(un, txt) {
+  if (un === 'KG' || un === 'L') return { unidade: un, tam: 1 };
+  const m = /^\s*([\d.,]+)\s*(kg|g|l|ml|un)\s*$/i.exec(String(txt || '')); if (!m) return { unidade: un, tam: 1 };
+  const n = tamNum(m[1]), u = m[2].toLowerCase();
+  return u === 'kg' ? { unidade: 'G', tam: n * 1000 } : u === 'g' ? { unidade: 'G', tam: n } : u === 'l' ? { unidade: 'ML', tam: n * 1000 } : u === 'ml' ? { unidade: 'ML', tam: n } : { unidade: 'UN', tam: n };
+}
+const PRODUTOS = [
+  ['Arroz tipo 1', 'Bom Grão', '789100010001', 'UN', '5 kg', 26.9, 'c_merc'], ['Feijão carioca', 'Bom Grão', '789100010002', 'UN', '1 kg', 8.49, 'c_merc'],
+  ['Café torrado e moído', 'Serra Azul', '789100010003', 'UN', '500 g', 19.9, 'c_merc'], ['Leite integral', 'Vale Doce', '789100010004', 'UN', '1 L', 5.29, 'c_merc'],
+  ['Açúcar cristal', 'Doce Lar', '789100010005', 'UN', '2 kg', 9.8, 'c_merc'], ['Óleo de soja', 'Campo Bom', '789100010006', 'UN', '900 ml', 7.49, 'c_merc'],
+  ['Macarrão espaguete', 'Nonna Tina', '789100010007', 'UN', '500 g', 4.99, 'c_merc'], ['Molho de tomate', 'Horta Viva', '789100010008', 'UN', '340 g', 3.29, 'c_merc'],
+  ['Ovos brancos', 'Granja Sol', '789100010009', 'UN', '12 un', 13.9, 'c_merc'], ['Pão de forma', 'Trigal', '789100010010', 'UN', '400 g', 8.99, 'c_pada'],
+  ['Manteiga com sal', 'Vale Doce', '789100010011', 'UN', '200 g', 12.49, 'c_merc'], ['Queijo muçarela', 'Vale Doce', '789100010012', 'KG', '1 kg', 44.9, 'c_merc'],
+  ['Banana prata', '', '', 'KG', '', 6.99, 'c_merc'], ['Tomate', '', '', 'KG', '', 8.49, 'c_merc'],
+  ['Filé de frango', 'Campo Bom', '789100010015', 'UN', '1 kg', 21.9, 'c_merc'], ['Detergente neutro', 'Brilho', '789100010016', 'UN', '500 ml', 2.79, 'c_limp'],
+  ['Sabão em pó', 'Brilho', '789100010017', 'UN', '1,6 kg', 18.9, 'c_limp'], ['Papel higiênico folha dupla', 'Macio', '789100010018', 'UN', '12 rolos', 21.5, 'c_hig'],
+  ['Creme dental', 'Sorriso', '789100010019', 'UN', '90 g', 4.59, 'c_hig'], ['Ração para cães adultos', 'Patas', '789100010020', 'UN', '10 kg', 129.9, 'c_pets'],
+  ['Água mineral sem gás', 'Fonte Clara', '789100010021', 'UN', '1,5 L', 2.99, 'c_merc'], ['Carvão vegetal', 'Brasa Boa', '789100010022', 'UN', '5 kg', 24.9, 'c_lazer'],
+  ['Picanha bovina', '', '', 'KG', '', 79.9, 'c_merc'], ['Linguiça toscana', 'Campo Bom', '789100010024', 'KG', '1 kg', 22.9, 'c_merc'],
+  ['Refrigerante de guaraná', 'Fresco', '789100010025', 'UN', '2 L', 8.49, 'c_merc'],
+];
+const LOJAS = [
+  ['l_bp', 'Supermercado Bom Preço', '11222333000181', -1.4489, -48.4851, 1.0], ['l_ap', 'Atacado Popular', '22333444000172', -1.4169, -48.4526, 0.9],
+  ['l_mb', 'Mercado do Bairro', '33444555000163', -1.4571, -48.4914, 1.07], ['l_fp', 'Feira da Pedreira', '', null, null, 0.86], ['l_hs', 'Hortifrúti Sol Nascente', '44555666000154', -1.4628, -48.4797, 0.94],
+];
+const PRODUCE = ['Banana prata', 'Tomate', 'Ovos brancos', 'Queijo muçarela', 'Picanha bovina'];
+
+function seedCatalogo() {
+  DB.catalogo = [{ gtin: gtin('789100010030'), nome: 'Biscoito recheado de chocolate', marca: 'Doce Lar', ...tamUn('UN', '130 g') ? { unidade: tamUn('UN', '130 g').unidade, tam_embalagem: tamUn('UN', '130 g').tam } : {} }, { gtin: gtin('789100010031'), nome: 'Achocolatado em pó', marca: 'Vale Doce', unidade: tamUn('UN', '400 g').unidade, tam_embalagem: tamUn('UN', '400 g').tam }, { gtin: gtin('789100010043'), nome: 'Cerveja puro malte 12 x 350 ml', marca: 'Rio Claro', unidade: 'UN', tam_embalagem: 1 }];
+  DB.lojasGlobais = [{ id: 'l_gl1', nome: 'Supermercado Litorâneo', cnpj: '55666777000145', cidade: 'Belém', uf: 'PA', latitude: -1.4402, longitude: -48.4721, global: true }];
+  DB.obs = []; DB.imagens = {};
+  const r = rng(7);
+  PRODUTOS.forEach(([nome, , g, , , base]) => {
+    if (!g) return;
+    const code = gtin(g);
+    [...LOJAS, ['l_gl1', 'Supermercado Litorâneo', '55666777000145', 0, 0, 0.93]].forEach(([, lnome, cnpj, , , k]) => {
+      if (!cnpj || r() < 0.35) return;
+      const st = r() < 0.55 ? 'validado' : 'observado', idade = Math.floor(r() * 26);
+      DB.obs.push({ observacao_id: nid('ob'), gtin: code, cnpj, loja: { nome: lnome, cidade: 'Belém', uf: 'PA' }, preco: r2(base * k * (0.92 + r() * 0.1)), data: addDays(T, -idade), origem: st === 'validado' ? 'nfce' : 'manual', status: st, confirmacoes: st === 'validado' ? 2 + Math.floor(r() * 5) : Math.floor(r() * 2), discordancias: 0, minha: false, meu_voto: null, escondido: false });
+    });
+  });
+  DB.obs.push({ observacao_id: nid('ob'), gtin: gtin('789100010003'), cnpj: '22333444000172', loja: { nome: 'Atacado Popular', cidade: 'Belém', uf: 'PA' }, preco: 4.99, data: addDays(T, -2), origem: 'manual', status: 'suspeito', confirmacoes: 0, discordancias: 1, minha: false, meu_voto: null, escondido: false });
+  DB.obs.push({ observacao_id: nid('ob'), gtin: gtin('789100010003'), cnpj: '55666777000145', loja: { nome: 'Supermercado Litorâneo', cidade: 'Belém', uf: 'PA' }, preco: 16.49, data: addDays(T, -1), origem: 'nfce', status: 'validado', confirmacoes: 4, discordancias: 0, minha: false, meu_voto: null, escondido: false });
+}
+
+function seedCompras(S, r) {
+  LOJAS.forEach(([id, nome, cnpj, lat, lng]) => S.lojas.push({ id, nome, cnpj: cnpj || null, cidade: 'Belém', uf: 'PA', latitude: lat, longitude: lng, status: 'ATIVA', versao: 1 }));
+  PRODUTOS.forEach(([nome, marca, g, un0, tam0, base, cat], i) => { const { unidade: un, tam } = tamUn(un0, tam0); S.produtos.push({ id: 'p' + (i + 1), nome, marca: marca || null, gtin: g ? gtin(g) : null, unidade: un, tam_embalagem: tam, categoria_id: cat, status: 'ATIVO', versao: 1, global_id: g ? 'g' + (i + 1) : null, _base: base }); });
+  for (const p of S.produtos) {
+    const lojas = PRODUCE.includes(p.nome) ? ['l_fp', 'l_hs', 'l_bp'] : ['l_bp', 'l_mb', 'l_ap'];
+    lojas.forEach((lid, j) => {
+      if (j === 2 && r() < 0.4) return;
+      const k = LOJAS.find((x) => x[0] === lid)[5];
+      [-84, -52, -23, -6].forEach((dd, t) => { if (j > 0 && t % 2) return; S.precos.push({ id: nid('pr'), produto_id: p.id, loja_id: lid, preco: r2(p._base * k * (0.9 + t * 0.035 + r() * 0.03)), data: addDays(T, dd - Math.floor(r() * 3)), origem: t === 3 ? 'nfce' : 'sessao' }); });
+    });
+  }
+  const P = (n) => S.produtos.find((p) => p.nome === n).id;
+  const lista = (nome, itens, arquivada) => { const id = nid('li'); S.listas.push({ id, nome, status: arquivada ? 'ARQUIVADA' : 'ATIVA', criado_em: addDays(T, -9) + 'T09:00:00', atualizado_em: addDays(T, -1) + 'T18:20:00' }); itens.forEach(([d, q, c]) => S.listaItens.push({ id: nid('lx'), lista_id: id, produto_id: S.produtos.some((p) => p.nome === d) ? P(d) : null, descricao: d, quantidade: q, comprado: !!c })); return id; };
+  S.listaItens = [];
+  lista('Mercado da semana', [['Arroz tipo 1', 1], ['Feijão carioca', 2], ['Café torrado e moído', 2], ['Leite integral', 6], ['Ovos brancos', 1, true], ['Banana prata', 1.5], ['Tomate', 1], ['Detergente neutro', 3], ['Papel higiênico folha dupla', 1, true], ['Pão de forma', 2], ['Pilhas AA', 1], ['Queijo muçarela', 0.5]]);
+  lista('Churrasco de sábado', [['Picanha bovina', 1.5], ['Linguiça toscana', 1], ['Carvão vegetal', 1], ['Refrigerante de guaraná', 3], ['Gelo em cubos 5 kg', 2]]);
+  lista('Farmácia', [['Protetor solar FPS 50', 1], ['Vitamina C efervescente', 2]]);
+  lista('Volta às aulas (janeiro)', [['Cadernos 10 matérias', 3]], true);
+  // Fase 8: lata × pacote com 12, preços opcionais, item digitado parecido com produto e compra aberta
+  const addP = (o) => { S.produtos.push({ id: o.id, nome: o.nome, marca: o.marca || null, gtin: o.gtin || null, unidade: o.unidade || 'UN', tam_embalagem: o.tam || 1, categoria_id: 'c_merc', status: 'ATIVO', versao: 1, global_id: o.gtin ? 'g_' + o.id : null, contem_id: o.contem_id || null, contem_qtd: o.contem_qtd || null }); return o.id; };
+  const lata = addP({ id: 'p_lata', nome: 'Cerveja pilsen lata', marca: 'Rio Claro', gtin: gtin('789100010040'), unidade: 'ML', tam: 350 });
+  const pack = addP({ id: 'p_pack', nome: 'Cerveja pilsen — pacote com 12', marca: 'Rio Claro', gtin: gtin('789100010041'), contem_id: lata, contem_qtd: 12 });
+  const leite = addP({ id: 'p_lpo', nome: 'Leite em pó integral', marca: 'Vale Doce', gtin: gtin('789100010042'), unidade: 'G', tam: 400 });
+  [[lata, 3.69], [pack, 33.08], [leite, 6.99]].forEach(([pid, v]) => S.precos.push({ id: nid('pr'), produto_id: pid, loja_id: 'l_ap', preco: r2(v * 1.04), data: addDays(T, -33), origem: 'sessao' }, { id: nid('pr'), produto_id: pid, loja_id: 'l_ap', preco: v, data: addDays(T, -4), origem: 'nfce' }));
+  S.opcoes = [
+    { id: 'op_lpo1', produto_id: leite, rotulo: 'Atacado', preco: 6.15, loja_id: 'l_ap', qtd_min: 5, status: 'ATIVO' },
+    { id: 'op_lpo2', produto_id: leite, rotulo: 'Cartão da loja', preco: 6.59, loja_id: 'l_ap', qtd_min: null, status: 'ATIVO' },
+    { id: 'op_lat1', produto_id: lata, rotulo: 'Atacado', preco: 3.2, loja_id: 'l_ap', qtd_min: 24, status: 'ATIVO' },
+    { id: 'op_lat2', produto_id: lata, rotulo: 'App', preco: 3.5, loja_id: null, qtd_min: null, status: 'ATIVO' },
+  ];
+  const li = lista('Atacado do mês', [['Feijao', 2], ['Cerveja pilsen lata', 12], ['Leite em pó integral', 4], ['Café torrado e moído', 1], ['Açafrão', 1]]);
+  const se = { id: nid('se'), lista_id: li, loja_id: 'l_ap', recurso_id: null, status: 'ABERTA', criado_em: T + 'T10:05:00', itens: [] };
+  S.sessoes.push(se);
+  syncSess(S, se);
+  const cafe = se.itens.find((i) => i.descricao === 'Café torrado e moído');
+  if (cafe) cafe.marcado = true;
+}
+
+function seedCasa() {
+  const S = baseSpace('ws_casa', 'Casa', 'admin');
+  S.membros.push({ usuario_id: 'u_raf', email: 'rafael.prado@exemplo.com', nome: 'Rafael Prado', papel: 'editor' }, { usuario_id: 'u_lia', email: 'lia.prado@exemplo.com', nome: 'Lia Prado', papel: 'leitura' });
+  const r = rng(42), start = addDays(monthStart(addMonths(T, -3)), -2);
+  const R = (o) => { S.recursos.push({ status: 'ATIVO', versao: 1, versao_recurso: 1, ...o }); return o.id; };
+  const cc = R({ id: 'r_cc', tipo: 'CONTA', nome: 'Conta corrente', instituicao: 'Banco Aurora', tipo_conta: 'CORRENTE', agencia: '0412', numero: '38127-4', saldo_inicial: 3200, data_saldo_inicial: start });
+  const pp = R({ id: 'r_pp', tipo: 'CONTA', nome: 'Poupança da família', instituicao: 'Cooperativa Rio Verde', tipo_conta: 'POUPANCA', saldo_inicial: 8500, data_saldo_inicial: start });
+  const ct = R({ id: 'r_ct', tipo: 'CARTEIRA', nome: 'Dinheiro na carteira', saldo_inicial: 180, data_saldo_inicial: start });
+  const k1 = R({ id: 'r_k1', tipo: 'CARTAO', nome: 'Cartão Aurora', instituicao: 'Banco Aurora', bandeira: 'Mastercard', final: '4821', limite: 6000, dia_fechamento: 3, dia_vencimento: 10, regra_fechamento: 'INCLUSIVO', recurso_pagamento_id: cc, anuidade: 0, taxa_juros: 12.9 });
+  const k2 = R({ id: 'r_k2', tipo: 'CARTAO', nome: 'Cartão Litoral Mais Internacional Platinum', instituicao: 'Banco Litoral', bandeira: 'Visa', final: '0937', limite: 4500, dia_fechamento: 25, dia_vencimento: 5, regra_fechamento: 'INCLUSIVO', recurso_pagamento_id: cc, anuidade: 39.9, taxa_juros: 14.5 });
+  const k3 = R({ id: 'r_k3', tipo: 'CARTAO', nome: 'Cartão virtual', instituicao: 'Banco Aurora', bandeira: 'Elo', final: '1156', limite: 0, dia_fechamento: 15, dia_vencimento: 22, regra_fechamento: 'EXCLUSIVO', recurso_pagamento_id: cc });
+  [[cc, 3200], [pp, 8500], [ct, 180]].forEach(([id, v]) => criarLanc(S, { tipo: 'ENTRADA', descricao: 'Saldo inicial', valor_bruto: v, data_evento: start, status: 'EFETIVADO', recurso_id: id }, { origem: 'SALDO_INICIAL', seed: true }));
+  seedCompras(S, r);
+  const ini = monthStart(addMonths(T, -3));
+  const rec = (o) => { const x = { id: nid('rc'), status: 'ATIVA', intervalo: null, data_final: null, recurso_destino_id: null, gerados: [], versao: 1, ...o }; S.recorrencias.push(x); return x; };
+  rec({ tipo_lancamento: 'ENTRADA', descricao: 'Salário Ana', valor: 6200, periodicidade: 'MENSAL', data_inicial: ini.slice(0, 8) + '05', recurso_id: cc, categoria_id: 'c_sal' });
+  rec({ tipo_lancamento: 'ENTRADA', descricao: 'Salário Rafael', valor: 4300, periodicidade: 'MENSAL', data_inicial: ini.slice(0, 8) + '20', recurso_id: cc, categoria_id: 'c_sal' });
+  rec({ tipo_lancamento: 'SAIDA', descricao: 'Aluguel', valor: 2100, periodicidade: 'MENSAL', data_inicial: ini.slice(0, 8) + '08', recurso_id: cc, categoria_id: 'c_alug' });
+  rec({ tipo_lancamento: 'SAIDA', descricao: 'Internet fibra 500 mega', valor: 119.9, periodicidade: 'MENSAL', data_inicial: ini.slice(0, 8) + '12', recurso_id: k1, categoria_id: 'c_net' });
+  rec({ tipo_lancamento: 'SAIDA', descricao: 'Streaming de filmes', valor: 39.9, periodicidade: 'MENSAL', data_inicial: ini.slice(0, 8) + '03', recurso_id: k2, categoria_id: 'c_assin' });
+  rec({ tipo_lancamento: 'TRANSFERENCIA', descricao: 'Guardar na poupança', valor: 800, periodicidade: 'MENSAL', data_inicial: ini.slice(0, 8) + '06', recurso_id: cc, recurso_destino_id: pp });
+  rec({ tipo_lancamento: 'TRANSFERENCIA', descricao: 'Saque para despesas do dia a dia', valor: 300, periodicidade: 'MENSAL', data_inicial: ini.slice(0, 8) + '02', recurso_id: cc, recurso_destino_id: ct });
+  rec({ tipo_lancamento: 'SAIDA', descricao: 'Plano de saúde familiar', valor: 689.5, periodicidade: 'MENSAL', data_inicial: ini.slice(0, 8) + '15', recurso_id: cc, categoria_id: 'c_plano' });
+  rec({ tipo_lancamento: 'SAIDA', descricao: 'Ração do Thor', valor: 129.9, periodicidade: 'A_CADA_N_DIAS', intervalo: 25, data_inicial: addDays(ini, 4), recurso_id: k1, categoria_id: 'c_pets', status: 'PAUSADA' });
+  rec({ tipo_lancamento: 'SAIDA', descricao: 'Revisão anual do carro', valor: 780, periodicidade: 'ANUAL', data_inicial: addMonths(T, 2), recurso_id: k2, categoria_id: 'c_manut' });
+  gerarRec(S, T, true);
+  // gastos variáveis
+  const S_ = (o) => criarLanc(S, { status: 'EFETIVADO', ...o }, { retro: false, seed: true });
+  const merc = S.produtos.filter((p) => !['Ração para cães adultos', 'Carvão vegetal', 'Picanha bovina'].includes(p.nome));
+  for (let d = addDays(start, 3); d <= T; d = addDays(d, 7 + Math.floor(r() * 2))) {
+    const n = 4 + Math.floor(r() * 4), its = [];
+    for (let i = 0; i < n; i++) { const p = merc[Math.floor(r() * merc.length)]; if (its.some((x) => x.produto_id === p.id)) continue; const q = 1 + Math.floor(r() * 3); its.push({ descricao: p.nome, quantidade: q, valor_unitario: r2(p._base * (0.95 + r() * 0.1)), produto_id: p.id, categoria_id: p.categoria_id }); }
+    its.forEach((i) => { i.valor_total = r2(i.quantidade * i.valor_unitario); });
+    S_({ tipo: 'SAIDA', descricao: r() < 0.6 ? 'Supermercado Bom Preço' : 'Mercado do Bairro', valor_bruto: r2(its.reduce((s, i) => s + i.valor_total, 0)), data_evento: d, recurso_id: k1, categoria_id: 'c_merc', itens: its });
+  }
+  for (let d = addDays(start, 1); d <= T; d = addDays(d, 3 + Math.floor(r() * 4))) S_({ tipo: 'SAIDA', descricao: 'Padaria Trigo de Ouro', valor_bruto: r2(14 + r() * 22), data_evento: d, recurso_id: ct, categoria_id: 'c_pada' });
+  for (let d = addDays(start, 5); d <= T; d = addDays(d, 13 + Math.floor(r() * 4))) S_({ tipo: 'SAIDA', descricao: 'Posto Avenida', valor_bruto: r2(180 + r() * 90), data_evento: d, recurso_id: k2, categoria_id: 'c_comb' });
+  for (let d = addDays(start, 9); d <= T; d = addDays(d, 9 + Math.floor(r() * 8))) S_({ tipo: 'SAIDA', descricao: ['Restaurante Sabor da Terra', 'Pizzaria Forno a Lenha', 'Açaí da Esquina'][Math.floor(r() * 3)], valor_bruto: r2(55 + r() * 130), data_evento: d, recurso_id: k1, categoria_id: 'c_rest' });
+  for (let d = addDays(start, 11); d <= T; d = addDays(d, 17 + Math.floor(r() * 8))) S_({ tipo: 'SAIDA', descricao: 'Farmácia Vida', valor_bruto: r2(40 + r() * 110), data_evento: d, recurso_id: k2, categoria_id: 'c_farm' });
+  for (let m = -3; m <= 0; m++) { const d = monthStart(addMonths(T, m)).slice(0, 8) + '16'; if (d <= T) S_({ tipo: 'SAIDA', descricao: 'Conta de energia', valor_bruto: r2(185 + r() * 80), data_evento: d, recurso_id: cc, categoria_id: 'c_ener' }); }
+  for (let m = -3; m <= -1; m++) { const d = monthStart(addMonths(T, m)).slice(0, 8) + '10'; S_({ tipo: 'SAIDA', descricao: 'Condomínio', valor_bruto: 640, data_evento: d, recurso_id: cc, categoria_id: 'c_cond' }); S_({ tipo: 'SAIDA', descricao: 'Conta de água', valor_bruto: r2(82 + r() * 20), data_evento: addDays(d, 3), recurso_id: cc, categoria_id: 'c_agua' }); }
+  for (let d = addDays(start, 20); d <= T; d = addDays(d, 12 + Math.floor(r() * 10))) S_({ tipo: 'SAIDA', descricao: 'Corrida por aplicativo', valor_bruto: r2(14 + r() * 26), data_evento: d, recurso_id: k1, categoria_id: 'c_app' });
+  S_({ tipo: 'SAIDA', descricao: 'Geladeira frost free 400 L', valor_bruto: 3890, parcelas: 10, data_evento: addDays(monthStart(addMonths(T, -2)), 13), recurso_id: k1, categoria_id: 'c_casa' });
+  S_({ tipo: 'SAIDA', descricao: 'Notebook para os estudos da Lia', valor_bruto: 2400, parcelas: 6, data_evento: addDays(monthStart(addMonths(T, -1)), 1), recurso_id: k2, categoria_id: 'c_edu', encargos: 0 });
+  S_({ tipo: 'SAIDA', descricao: 'Presente de aniversário da vovó Lurdes — cesta de café da manhã com entrega', valor_bruto: 189.9, descontos: 10, data_evento: addDays(T, -12), recurso_id: k1, categoria_id: 'c_pres' });
+  S_({ tipo: 'SAIDA', descricao: 'Aplicativo de fotos — plano anual', valor_bruto: 59.9, data_evento: addDays(T, -20), recurso_id: k3, categoria_id: 'c_assin' });
+  S_({ tipo: 'SAIDA', descricao: 'Boliche com as crianças', valor_bruto: 96, data_evento: T > monthStart(T) ? addDays(T, -1) : T, recurso_id: k1, categoria_id: 'c_lazer' });
+  S_({ tipo: 'SAIDA', descricao: 'Cinema e pipoca', valor_bruto: 128, data_evento: T > monthStart(T) ? addDays(T, -1) : T, recurso_id: k1, categoria_id: 'c_lazer' });
+  S_({ tipo: 'SAIDA', descricao: 'Ingressos do parque aquático', valor_bruto: 360, data_evento: addDays(T, -15), recurso_id: k2, categoria_id: 'c_lazer' });
+  S_({ tipo: 'ENTRADA', descricao: 'Venda do carro antigo', valor_bruto: 48750, data_evento: addDays(monthStart(addMonths(T, -2)), 18), recurso_id: pp, categoria_id: 'c_vendas' });
+  S_({ tipo: 'ENTRADA', descricao: 'Projeto de ilustração', valor_bruto: 1500, data_evento: addDays(monthStart(addMonths(T, -1)), 22), recurso_id: cc, categoria_id: 'c_free' });
+  S_({ tipo: 'ENTRADA', descricao: 'Rendimento da poupança', valor_bruto: 61.37, data_evento: monthStart(T), recurso_id: pp, categoria_id: 'c_rend' });
+  S_({ tipo: 'TRANSFERENCIA', descricao: 'Saque para a feira', valor_bruto: 150, data_evento: addDays(T, -9), origem_id: cc, destino_id: ct });
+  // estorno
+  const tenis = S_({ tipo: 'SAIDA', descricao: 'Tênis de corrida', valor_bruto: 459.9, data_evento: addDays(T, -18), recurso_id: k1, categoria_id: 'c_vest' });
+  estornar(S, tenis, 'Produto devolvido na loja', addDays(T, -14), true);
+  // pendentes e planejados
+  criarLanc(S, { tipo: 'SAIDA', descricao: 'Conta de água', valor_bruto: 96.3, data_evento: addDays(T, -4), status: 'PENDENTE', recurso_id: cc, categoria_id: 'c_agua' }, { seed: true });
+  criarLanc(S, { tipo: 'SAIDA', descricao: 'Condomínio', valor_bruto: 640, data_evento: addDays(T, -1), status: 'PENDENTE', recurso_id: cc, categoria_id: 'c_cond' }, { seed: true });
+  criarLanc(S, { tipo: 'SAIDA', descricao: 'IPTU — parcela 8 de 10', valor_bruto: 186.4, data_evento: addDays(T, 12), recurso_id: cc, categoria_id: 'c_tarifa' }, { seed: true });
+  criarLanc(S, { tipo: 'SAIDA', descricao: 'Mensalidade da natação', valor_bruto: 230, data_evento: addDays(T, 3), recurso_id: cc, categoria_id: 'c_lazer' }, { seed: true });
+  criarLanc(S, { tipo: 'ENTRADA', descricao: 'Reembolso do plano de saúde', valor_bruto: 420, data_evento: addDays(T, 6), recurso_id: cc, categoria_id: 'c_reemb' }, { seed: true });
+  const show = criarLanc(S, { tipo: 'SAIDA', descricao: 'Show no estádio', valor_bruto: 520, data_evento: addDays(T, 20), recurso_id: k1, categoria_id: 'c_lazer' }, { seed: true });
+  show.status = 'CANCELADO';
+  // pagamentos de faturas
+  for (const kid of [k1, k2]) {
+    const fs = faturasDe(S, kid).filter((f) => f.status !== 'ABERTA' && f.data_vencimento < T).reverse();
+    fs.forEach((f, i) => { const last = i === fs.length - 1; const v = kid === k2 && last ? r2(f.valor_total * 0.4) : f.valor_total; if (v > 0) pagarFatura(S, f, cc, v, f.data_vencimento, true); });
+  }
+  // planejamentos
+  const mi = monthStart(T), mf = monthEnd(T);
+  const pm1 = monthStart(addMonths(T, -1)), pm2 = monthStart(addMonths(T, -2));
+  const mercCats = () => [{ categoria_id: 'c_alim', valor_limite: 1400, percentual_execucao: 100 }, { categoria_id: 'c_casa', valor_limite: 400, percentual_execucao: 100 }];
+  const mensal = () => ({ periodicidade: 'MENSAL', intervalo: 1, ate: null, status: 'ATIVA' });
+  S.planejamentos.push({ id: 'pl1a', nome: 'Mercado e casa', tipo: 'SAIDA', serie_id: 'pl1', recorrencia: null, data_inicio: pm2, data_fim: monthEnd(pm2), valor_limite: 1600, prioridade: 1, status: 'ATIVO', versao: 1, categorias: [{ categoria_id: 'c_alim', valor_limite: 1250, percentual_execucao: 100 }, { categoria_id: 'c_casa', valor_limite: 350, percentual_execucao: 100 }] });
+  S.planejamentos.push({ id: 'pl1b', nome: 'Mercado e casa', tipo: 'SAIDA', serie_id: 'pl1', recorrencia: null, data_inicio: pm1, data_fim: monthEnd(pm1), valor_limite: 1800, prioridade: 1, status: 'ATIVO', versao: 1, categorias: mercCats() });
+  S.planejamentos.push({ id: 'pl1', nome: 'Mercado e casa', tipo: 'SAIDA', serie_id: 'pl1', recorrencia: mensal(), data_inicio: mi, data_fim: mf, valor_limite: 1800, prioridade: 1, status: 'ATIVO', versao: 1, categorias: mercCats() });
+  S_({ tipo: 'ENTRADA', descricao: 'Revisão de portfólio', valor_bruto: 850, data_evento: mi, recurso_id: cc, categoria_id: 'c_free' });
+  const rendaCats = () => [{ categoria_id: 'c_sal', valor_limite: 10500, percentual_execucao: 100 }, { categoria_id: 'c_free', valor_limite: 1500, percentual_execucao: 100 }];
+  S.planejamentos.push({ id: 'pl5a', nome: 'Renda do mês', tipo: 'ENTRADA', serie_id: 'pl5', recorrencia: null, data_inicio: pm1, data_fim: monthEnd(pm1), valor_limite: 12000, prioridade: 1, status: 'ATIVO', versao: 1, categorias: rendaCats() });
+  S.planejamentos.push({ id: 'pl5', nome: 'Renda do mês', tipo: 'ENTRADA', serie_id: 'pl5', recorrencia: mensal(), data_inicio: mi, data_fim: mf, valor_limite: 12000, prioridade: 1, status: 'ATIVO', versao: 1, categorias: rendaCats() });
+  S.planejamentos.push({ id: 'pl2', nome: 'Lazer e passeios', data_inicio: mi, data_fim: mf, valor_limite: 180, prioridade: 2, status: 'ATIVO', versao: 1, categorias: [{ categoria_id: 'c_lazer', valor_limite: 150, percentual_execucao: 100 }, { categoria_id: 'c_pres', valor_limite: 30, percentual_execucao: 100 }] });
+  S.planejamentos.push({ id: 'pl3', nome: 'Transporte', data_inicio: mi, data_fim: mf, valor_limite: 750, prioridade: 3, status: 'ATIVO', versao: 1, categorias: [{ categoria_id: 'c_transp', valor_limite: 750, percentual_execucao: 100 }] });
+  S.planejamentos.push({ id: 'pl4', nome: 'Saúde do ano', data_inicio: T.slice(0, 4) + '-01-01', data_fim: T.slice(0, 4) + '-12-31', valor_limite: 9600, prioridade: 4, status: 'ATIVO', versao: 1, categorias: [{ categoria_id: 'c_saude', valor_limite: 9600, percentual_execucao: 100 }] });
+  // histórico de um lançamento
+  const ex = S.lancamentos.filter((l) => l.descricao === 'Supermercado Bom Preço').slice(-1)[0];
+  // cheque especial, rendimento e histórico de configuração (Fase 5)
+  Object.assign(recOf(S, pp), { taxa_rendimento: 0.5, rendimento_unidade: 'MES', cheque_especial: false, limite_cheque: null });
+  const lt = R({ id: 'r_lt', tipo: 'CONTA', nome: 'Conta Banco Litoral', instituicao: 'Banco Litoral', tipo_conta: 'CORRENTE', agencia: '1290', numero: '55102-8', saldo_inicial: 1200, data_saldo_inicial: start, data_criacao: start,
+    cheque_especial: true, limite_cheque: 10000, juros_cheque: 8, juros_cheque_unidade: 'MES', taxa_rendimento: 0, rendimento_unidade: 'MES' });
+  const dg = R({ id: 'r_dg', tipo: 'CONTA', nome: 'Conta digital Ponte', instituicao: 'Ponte', tipo_conta: 'PAGAMENTO', saldo_inicial: 0, data_saldo_inicial: start, data_criacao: start,
+    cheque_especial: true, limite_cheque: 500, juros_cheque: 12, juros_cheque_unidade: 'MES', taxa_rendimento: 0, rendimento_unidade: 'MES' });
+  criarLanc(S, { tipo: 'ENTRADA', descricao: 'Saldo inicial', valor_bruto: 1200, data_evento: start, status: 'EFETIVADO', recurso_id: lt }, { origem: 'SALDO_INICIAL', seed: true });
+  S_({ tipo: 'SAIDA', descricao: 'Reforma do banheiro', valor_bruto: 6800, data_evento: addDays(T, -24), recurso_id: lt, categoria_id: 'c_casa' });
+  S_({ tipo: 'SAIDA', descricao: 'Material de construção', valor_bruto: 1946.31, data_evento: addDays(T, -10), recurso_id: lt, categoria_id: 'c_casa' });
+  criarLanc(S, { tipo: 'SAIDA', descricao: 'Parcela do empréstimo', valor_bruto: 2900, data_evento: addDays(T, -1), status: 'PENDENTE', recurso_id: lt, categoria_id: 'c_tarifa' }, { seed: true });
+  S_({ tipo: 'SAIDA', descricao: 'Assinatura de software', valor_bruto: 480, data_evento: addDays(T, -16), recurso_id: dg, categoria_id: 'c_assin' });
+  S_({ tipo: 'SAIDA', descricao: 'Juros do limite', valor_bruto: 62.4, data_evento: addDays(T, -2), recurso_id: dg, categoria_id: 'c_tarifa', cobranca_banco: true });
+  rec({ tipo_lancamento: 'SAIDA', descricao: 'Juros do limite', valor: 603.7, periodicidade: 'MENSAL', data_inicial: monthStart(addMonths(T, 1)), recurso_id: lt, categoria_id: 'c_tarifa', cobranca_banco: true });
+  const RAF = { id: 'u_raf', nome: 'Rafael Prado' }, ANA = { id: DB.usuario.id, nome: DB.usuario.nome };
+  S.historico = [];
+  const H = (rid, campo, ant, novo, quem, dia, hora = '10:00') => histAdd(S, rid.startsWith('pl') ? { id: rid, entidade: 'planejamento' } : recOf(S, rid), campo, ant, novo, quem, dia + 'T' + hora + ':00');
+  H(lt, 'limite_cheque', '', '5000', RAF, start, '09:12'); H(lt, 'juros_cheque', '', '8', RAF, start, '09:12');
+  H(lt, 'limite_cheque', '5000', '8000', ANA, addDays(start, 30), '18:40');
+  H(lt, 'limite_cheque', '8000', '10000', RAF, addDays(T, -26), '11:05'); H(lt, 'nome', 'Conta Litoral', 'Conta Banco Litoral', ANA, addDays(T, -26), '11:20');
+  H(dg, 'limite_cheque', '', '1000', ANA, start, '20:00'); H(dg, 'juros_cheque', '', '12', ANA, start, '20:00'); H(dg, 'limite_cheque', '1000', '500', RAF, addDays(T, -20), '08:30');
+  H(pp, 'taxa_rendimento', '', '0.5', ANA, start, '09:30');
+  H(k1, 'limite', '', '4000', ANA, start, '09:40'); H(k1, 'limite', '4000', '5000', ANA, addDays(start, 20), '14:10'); H(k1, 'limite', '5000', '6000', RAF, addDays(T, -40), '16:00'); H(k1, 'dia_vencimento', '12', '10', ANA, addDays(T, -40), '16:05');
+  H(k2, 'limite', '', '4500', RAF, start, '10:15'); H(k2, 'anuidade', '0', '39.9', RAF, addDays(T, -33), '12:00');
+  H('pl1', 'valor_limite', '1600', '1800', ANA, pm1, '08:00');
+  if (ex) { S.auditoria.push({ entidade_id: ex.id, quando: ex.criado_em, quem: 'Rafael Prado', acao: 'criado', mudancas: {} }, { entidade_id: ex.id, quando: addDays(ex.data_evento, 1) + 'T21:14:00', quem: 'Ana Prado', acao: 'atualizado', mudancas: { descricao: ['Mercado', 'Supermercado Bom Preço'] } }); ex.versao = 2; }
+  return S;
+}
+function seedPraia() {
+  const S = baseSpace('ws_praia', 'Apartamento da praia', 'leitura');
+  S.recursos.push({ id: 'rp_cc', tipo: 'CONTA', nome: 'Conta do condomínio da praia', instituicao: 'Banco Litoral', tipo_conta: 'CORRENTE', status: 'ATIVO', versao: 1, saldo_inicial: 1200 });
+  criarLanc(S, { tipo: 'ENTRADA', descricao: 'Saldo inicial', valor_bruto: 1200, data_evento: addDays(T, -60), status: 'EFETIVADO', recurso_id: 'rp_cc' }, { origem: 'SALDO_INICIAL', seed: true });
+  criarLanc(S, { tipo: 'ENTRADA', descricao: 'Aluguel de temporada', valor_bruto: 2600, data_evento: addDays(T, -20), recurso_id: 'rp_cc', categoria_id: 'c_vendas' }, { seed: true });
+  criarLanc(S, { tipo: 'SAIDA', descricao: 'Faxina após hóspedes', valor_bruto: 180, data_evento: addDays(T, -18), recurso_id: 'rp_cc', categoria_id: 'c_limp' }, { seed: true });
+  criarLanc(S, { tipo: 'SAIDA', descricao: 'Energia do apartamento', valor_bruto: 142.8, data_evento: addDays(T, 5), recurso_id: 'rp_cc', categoria_id: 'c_ener' }, { seed: true });
+  return S;
+}
+function seed() {
+  DB = { seq: 0, usuario: { id: 'u_ana', email: 'ana.prado@exemplo.com', nome: 'Ana Prado', papel_plataforma: 'admin' }, spaces: [], rids: {}, logado: false, banco: true };
+  seedCatalogo();
+  DB.spaces.push(seedCasa(), seedPraia());
+  DB.reputacao = { pontos: 14, nivel: 'novo', observacoes: 23, validadas: 15, rejeitadas: 1 };
+  DB.admin = {
+    cadastro_aberto: true,
+    usuarios: [{ email: 'ana.prado@exemplo.com', nome: 'Ana Prado', ativo: true, papel: 'admin', nivel: 'confiavel' }, { email: 'rafael.prado@exemplo.com', nome: 'Rafael Prado', ativo: true, papel: 'usuario', nivel: 'novo' }, { email: 'joao.silva@exemplo.com', nome: 'João Silva', ativo: true, papel: 'usuario', nivel: 'novo' }],
+    denuncias: [
+      { alvo_tipo: 'preco', alvo_id: DB.obs[DB.obs.length - 2].observacao_id, resumo: 'Café torrado e moído · R$ 4,99 · Atacado Popular', pessoas: 3, motivos: ['Preço impossível', 'Era outro produto', 'Promoção já acabou'], status_atual: 'em_revisao' },
+      { alvo_tipo: 'produto', alvo_id: 'g99', resumo: 'Produto "OFERTA IMPERDIVEL CLIQUE"', pessoas: 2, motivos: ['Nome com propaganda', 'Spam'], status_atual: 'visivel' },
+      { alvo_tipo: 'imagem', alvo_id: gtin('789100010016'), resumo: 'Foto de Detergente neutro', pessoas: 1, motivos: ['Foto de outro produto'], status_atual: 'visivel' },
+    ],
+    repetidos: [{ chave: 'Leite integral 1 L', itens: [{ id: 'g4', nome: 'Leite integral', marca: 'Vale Doce', gtin: gtin('789100010004') }, { id: 'g88', nome: 'LEITE INTEGRAL VALE DOCE 1L', marca: 'Vale Doce', gtin: '7891000100880' }] }],
+    imagens: [{ gtin: gtin('789100010016'), produto: 'Detergente neutro', ativa: true }],
+  };
+  seedConvites();
+  DB.desl = { [DB.usuario.id]: seedDesl() };
+  save();
+}
+
+function seedConvites() {
+  const casa = DB.spaces.find((s) => s.id === 'ws_casa');
+  casa.convites = [
+    { id: 'cv_e1', espaco_id: 'ws_casa', espaco_nome: 'Casa', email: 'tio.marcos@exemplo.com', papel: 'editor', status: 'PENDENTE', convidado_por_nome: 'Ana Prado', expira_em: addDays(T, 9), respondido_em: null, criado_em: addDays(T, -5) + 'T14:10:00' },
+    { id: 'cv_e2', espaco_id: 'ws_casa', espaco_nome: 'Casa', email: 'bruno.lima@exemplo.com', papel: 'leitura', status: 'PENDENTE', convidado_por_nome: 'Ana Prado', expira_em: addDays(T, -1), respondido_em: null, criado_em: addDays(T, -15) + 'T09:30:00' },
+    { id: 'cv_e3', espaco_id: 'ws_casa', espaco_nome: 'Casa', email: 'carla.souza@exemplo.com', papel: 'editor', status: 'ACEITO', convidado_por_nome: 'Ana Prado', expira_em: addDays(T, -3), respondido_em: addDays(T, -6) + 'T20:00:00', criado_em: addDays(T, -10) + 'T11:00:00' },
+    { id: 'cv_e4', espaco_id: 'ws_casa', espaco_nome: 'Casa', email: 'dido.antigo@exemplo.com', papel: 'leitura', status: 'RECUSADO', convidado_por_nome: 'Ana Prado', expira_em: addDays(T, -20), respondido_em: addDays(T, -25) + 'T08:00:00', criado_em: addDays(T, -28) + 'T08:00:00' },
+  ];
+  const sitio = baseSpace('ws_sitio', 'Sítio dos Prado', 'editor');
+  sitio.membros = [{ usuario_id: 'u_raf', email: 'rafael.prado@exemplo.com', nome: 'Rafael Prado', papel: 'admin' }];
+  sitio.recursos.push({ id: 'rs_cc', tipo: 'CONTA', nome: 'Conta do sítio', instituicao: 'Banco Aurora', tipo_conta: 'CORRENTE', status: 'ATIVO', versao: 1, versao_recurso: 1, saldo_inicial: 900 });
+  criarLanc(sitio, { tipo: 'ENTRADA', descricao: 'Saldo inicial', valor_bruto: 900, data_evento: addDays(T, -40), status: 'EFETIVADO', recurso_id: 'rs_cc' }, { origem: 'SALDO_INICIAL', seed: true });
+  const viagem = baseSpace('ws_viagem', 'Rateio da viagem', 'leitura');
+  viagem.membros = [{ usuario_id: 'u_mar', email: 'marina.alves@exemplo.com', nome: 'Marina Alves', papel: 'admin' }];
+  DB.spacesConvite = { ws_sitio: sitio, ws_viagem: viagem };
+  DB.convitesRecebidos = [
+    { id: 'cv_r1', espaco_id: 'ws_sitio', espaco_nome: 'Sítio dos Prado', email: DB.usuario.email, papel: 'editor', status: 'PENDENTE', convidado_por_nome: 'Rafael Prado', expira_em: addDays(T, 11), respondido_em: null, criado_em: addDays(T, -0) + 'T08:05:00' },
+    { id: 'cv_r2', espaco_id: 'ws_viagem', espaco_nome: 'Rateio da viagem', email: DB.usuario.email, papel: 'leitura', status: 'PENDENTE', convidado_por_nome: 'Marina Alves', expira_em: addDays(T, 2), respondido_em: null, criado_em: addDays(T, -1) + 'T16:40:00' },
+  ];
+  DB.notificacoes = [
+    { id: 'nt13', tipo: 'CHEQUE_ESPECIAL', titulo: 'Conta digital Ponte acima do limite', texto: 'Saldo −R$ 542,40, limite R$ 500,00. Excesso de R$ 42,40.', lida: false, ref_id: 'cheq:r_dg:acima:500:' + T.slice(0, 7), espaco_id: '', criada_em: T + 'T06:00:00' },
+    { id: 'nt1', tipo: 'CONVITE_RECEBIDO', titulo: 'Convite para o espaço Sítio dos Prado', texto: 'Rafael Prado convidou você como editor.', lida: false, ref_id: 'cv_r1', espaco_id: 'ws_sitio', criada_em: addDays(T, -0) + 'T08:05:00' },
+    { id: 'nt2', tipo: 'CONVITE_RECEBIDO', titulo: 'Convite para o espaço Rateio da viagem', texto: 'Marina Alves convidou você como leitura.', lida: false, ref_id: 'cv_r2', espaco_id: 'ws_viagem', criada_em: addDays(T, -1) + 'T16:40:00' },
+    { id: 'nt3', tipo: 'PAPEL_ALTERADO', titulo: 'Seu papel mudou', texto: 'Agora você é editor no espaço Apartamento da praia.', lida: false, ref_id: null, espaco_id: 'ws_praia', criada_em: addDays(T, -2) + 'T12:30:00' },
+    { id: 'nt4', tipo: 'CONVITE_ACEITO', titulo: 'Convite aceito', texto: 'Carla Souza aceitou seu convite para o espaço Casa.', lida: true, ref_id: 'cv_e3', espaco_id: 'ws_casa', criada_em: addDays(T, -6) + 'T20:00:00' },
+    { id: 'nt5', tipo: 'CONVITE_RECUSADO', titulo: 'Convite recusado', texto: 'Dido não aceitou seu convite para o espaço Casa.', lida: true, ref_id: 'cv_e4', espaco_id: 'ws_casa', criada_em: addDays(T, -25) + 'T08:00:00' },
+    { id: 'nt6', tipo: 'LANCAMENTO_MEMBRO', titulo: 'Rafael Prado fez 3 lançamentos em Casa', texto: 'O último: Farmácia, R$ 48,90.', lida: false, ref_id: 'lanc:u_raf:ws_casa', espaco_id: 'ws_casa', criada_em: T + 'T10:20:00' },
+    { id: 'nt7', tipo: 'FATURA_VENCENDO', titulo: 'Fatura Cartão Aurora vence em 2 dias', texto: 'Pague até o vencimento para evitar juros.', lida: false, ref_id: 'fat:r_k1', espaco_id: 'ws_casa', criada_em: T + 'T06:00:00' },
+    { id: 'nt8', tipo: 'PLANEJAMENTO_80', titulo: 'Lazer e passeios chegou a 80%', texto: 'Você já usou 80% do limite deste planejamento.', lida: false, ref_id: 'plan:pl2:80:180', espaco_id: 'ws_casa', criada_em: T + 'T06:00:00' },
+    { id: 'nt9', tipo: 'QUEDA_PRECO', titulo: 'Café torrado e moído 15% mais barato', texto: 'R$ 16,90 em outra loja; você costuma pagar R$ 19,90.', lida: false, ref_id: 'prec:p3:16.9:' + addDays(T, -1), espaco_id: 'ws_casa', criada_em: addDays(T, -1) + 'T06:00:00' },
+    { id: 'nt10', tipo: 'PLANEJAMENTO_100', titulo: 'Transporte chegou ao limite', texto: 'O planejamento usou 100% do valor planejado.', lida: true, ref_id: 'plan:pl3:100:750', espaco_id: 'ws_casa', criada_em: addDays(T, -3) + 'T06:00:00' },
+    { id: 'nt12', tipo: 'PLANEJAMENTO_100', titulo: 'Planejamento "Renda do mês": meta batida', texto: 'Você recebeu toda a meta do período.', lida: true, ref_id: 'plan:pl5a:100:12000', espaco_id: 'ws_casa', criada_em: addDays(T, -3) + 'T06:05:00' },
+    { id: 'nt11', tipo: 'LANCAMENTO_MEMBRO', titulo: 'Lia Prado lançou uma despesa em Apartamento da praia', texto: 'Condomínio, R$ 650,00.', lida: true, ref_id: 'lanc:u_lia:ws_praia', espaco_id: 'ws_praia', criada_em: addDays(T, -4) + 'T19:10:00' },
+  ];
+}
+
+// ---------- relatórios ----------
+function painel(S, de, ate) {
+  const contas = S.recursos.filter((x) => x.tipo !== 'CARTAO' && x.status !== 'INATIVO'), cards = S.recursos.filter((x) => x.tipo === 'CARTAO' && x.status !== 'INATIVO');
+  const onde = contas.map((c) => ({ recurso_id: c.id, nome: c.nome, tipo: c.tipo, saldo: saldo(S, c.id) }));
+  const cs = cards.map((k) => { const s = situacaoCartao(S, k.id); return { recurso_id: k.id, nome: k.nome, limite: s.limite, comprometido: s.limite_comprometido, disponivel: s.limite_disponivel }; });
+  const fl = fluxo(S, addDays(T, 30)), lines = linhasConsumo(S, de, ate);
+  const porCat = {};
+  lines.forEach((l) => { const rc = rootCat(S, l.categoria_id) || '_'; porCat[rc] = (porCat[rc] || 0) + l.valor; });
+  const gasto = r2(lines.reduce((s, l) => s + l.valor, 0)), rec = receitas(S, de, ate);
+  return {
+    quanto_tenho: r2(onde.reduce((s, x) => s + x.saldo, 0)), onde_esta: onde, comprometido_nos_cartoes: r2(cs.reduce((s, x) => s + x.comprometido, 0)), cartoes: cs,
+    limite_disponivel_total: r2(cs.reduce((s, x) => s + x.disponivel, 0)), a_pagar: fl.a_pagar, a_receber: fl.a_receber,
+    patrimonio_liquido: r2(S.recursos.reduce((s, x) => s + saldo(S, x.id), 0)), gasto_no_periodo: gasto, resultado_no_periodo: r2(rec - gasto),
+    gasto_por_categoria: Object.entries(porCat).map(([id, v]) => ({ categoria_id: id === '_' ? null : id, nome: id === '_' ? 'Sem categoria' : S.categorias.find((c) => c.id === id).nome, valor: r2(v) })).filter((x) => x.valor > 0).sort((a, b) => b.valor - a.valor),
+    planejamentos: S.planejamentos.filter((p) => p.status === 'ATIVO' && p.data_inicio <= ate && (!p.data_fim || p.data_fim >= de) && (!p.serie_id || vigenteP(p))).map((p) => situacaoPlan(S, p)),
+  };
+}
+function receitas(S, de, ate, porCat) {
+  let t = 0;
+  for (const l of S.lancamentos) {
+    if (l.data_evento < de || l.data_evento > ate || !['EFETIVADO', 'ESTORNADO'].includes(l.status) && l.origem !== 'ESTORNO') continue;
+    if (l.status !== 'EFETIVADO' && l.status !== 'ESTORNADO') continue;
+    let v = 0;
+    if (l.tipo === 'ENTRADA' && !['SALDO_INICIAL', 'ESTORNO'].includes(l.origem)) v = l.valor_total;
+    if (l.tipo === 'SAIDA' && l.origem === 'ESTORNO') v = -l.valor_total;
+    if (!v) continue;
+    t += v;
+    if (porCat) { const rc = rootCat(S, l.categoria_id) || '_'; porCat[rc] = (porCat[rc] || 0) + v; }
+  }
+  return r2(t);
+}
+const encargos = (S, de, ate) => r2(S.lancamentos.filter((l) => l.data_evento >= de && l.data_evento <= ate && l.status === 'EFETIVADO').reduce((s, l) => s + (l.encargos || 0), 0));
+function fluxo(S, ate) {
+  const itens = [];
+  for (const l of S.lancamentos) {
+    if (!['PLANEJADO', 'PENDENTE'].includes(l.status) || l.data_evento > ate || l.tipo === 'TRANSFERENCIA') continue;
+    const r = recOf(S, l.recurso_id);
+    if (r && r.tipo === 'CARTAO') continue;
+    itens.push({ id: l.id, data: l.data_evento, tipo: l.tipo === 'ENTRADA' ? 'RECEBER' : 'PAGAR', origem: 'LANCAMENTO', descricao: l.descricao, valor: l.valor_total, atrasado: l.data_evento < T, recurso_id: l.recurso_id, status: l.status });
+  }
+  for (const k of S.recursos.filter((x) => x.tipo === 'CARTAO' && x.status !== 'INATIVO')) for (const f of faturasDe(S, k.id)) {
+    if (f.data_vencimento > ate) continue;
+    const v = f.status === 'ABERTA' ? f.valor_total - f.valor_pago : f.valor_em_aberto;
+    if (v <= 0) continue;
+    itens.push({ id: f.id, data: f.data_vencimento, tipo: 'PAGAR', origem: 'FATURA', descricao: 'Fatura · ' + k.nome, valor: r2(v), atrasado: f.data_vencimento < T, recurso_id: k.id, status: f.status });
+  }
+  itens.sort((a, b) => (a.data < b.data ? -1 : 1));
+  return { a_pagar: r2(itens.filter((i) => i.tipo === 'PAGAR').reduce((s, i) => s + i.valor, 0)), a_receber: r2(itens.filter((i) => i.tipo === 'RECEBER').reduce((s, i) => s + i.valor, 0)), itens };
+}
+
+// ---------- compras ----------
+const prodOf = (S, id) => S.produtos.find((p) => p.id === id);
+const lojaOf = (S, id) => S.lojas.find((l) => l.id === id) || DB.lojasGlobais.find((l) => l.id === id);
+function precoEm(S, pid, lid) {
+  const p = prodOf(S, pid), l = lojaOf(S, lid);
+  if (!p || !l) return null;
+  const mine = S.precos.filter((x) => x.produto_id === pid && x.loja_id === lid).sort((a, b) => (a.data < b.data ? 1 : -1))[0];
+  const sh = p.gtin && l.cnpj ? DB.obs.filter((o) => o.gtin === p.gtin && o.cnpj === l.cnpj && ['observado', 'validado'].includes(o.status) && !o.escondido).sort((a, b) => (a.data < b.data ? 1 : -1))[0] : null;
+  if (mine && (!sh || mine.data >= sh.data)) return { preco: mine.preco, fonte: 'MEU', data: mine.data };
+  if (sh) return { preco: sh.preco, fonte: 'COMPARTILHADO', data: sh.data };
+  return null;
+}
+const ultimoPago = (S, pid) => S.precos.filter((x) => x.produto_id === pid).sort((a, b) => (a.data < b.data ? 1 : -1))[0] || null;
+// produtos.indice (demo): carimba "atualizado" quando a visão do produto muda (nome, preço, imagem, status…)
+const IDX = new Map();
+function idxMarcar(S) {
+  const m = IDX.get(S.id) || { sig: {}, at: {} }, t = new Date().toISOString();
+  IDX.set(S.id, m);
+  for (const p of S.produtos) { const s = JSON.stringify(viewProd(S, p)); if (m.sig[p.id] !== s) { m.sig[p.id] = s; m.at[p.id] = t; } }
+  return m.at;
+}
+const viewProd = (S, p) => { const { _base, ...v } = p; const u = ultimoPago(S, p.id), c = p.contem_id && prodOf(S, p.contem_id); return { ...v, contem_id: c ? c.id : null, contem_qtd: c ? p.contem_qtd : null, contem_nome: c ? c.nome : null, preco_unidade: c && u ? r2(u.preco / p.contem_qtd) : null, pacotes: S.produtos.filter((x) => x.contem_id === p.id && x.status !== 'INATIVO').map((x) => ({ id: x.id, nome: x.nome, contem_qtd: x.contem_qtd })), tem_imagem: !!DB.imagens[p.id] || !!(p.gtin && DB.imagens['g:' + p.gtin]), ultimo_preco: u ? u.preco : null, ultimo_preco_data: u ? u.data : null }; };
+const hav = (a, b, c, d) => { const R = 6371, t = (x) => x * Math.PI / 180; const x = Math.sin(t(c - a) / 2) ** 2 + Math.cos(t(a)) * Math.cos(t(c)) * Math.sin(t(d - b) / 2) ** 2; return 2 * R * Math.asin(Math.sqrt(x)); };
+function listaView(S, li) {
+  const its = S.listaItens.filter((i) => i.lista_id === li.id);
+  return { ...li, itens: its.length, comprados: its.filter((i) => i.comprado).length };
+}
+// ---------- Fase 8: pacotes, preços opcionais e lista = compra ----------
+const opcs = (S) => S.opcoes || (S.opcoes = []);
+const opcView = (S, o) => ({ id: o.id, produto_id: o.produto_id, rotulo: o.rotulo, preco: o.preco, loja_id: o.loja_id || null, loja_nome: o.loja_id ? (lojaOf(S, o.loja_id) || {}).nome || '' : null, qtd_min: o.qtd_min || null, status: o.status });
+const opcoesDe = (S, pid, lid) => opcs(S).filter((o) => o.produto_id === pid && o.status !== 'INATIVO' && (!o.loja_id || o.loja_id === lid)).sort((a, b) => a.preco - b.preco);
+function normalDe(S, pid, lid) {
+  if (lid) return precoEm(S, pid, lid);
+  const u = ultimoPago(S, pid);
+  return u ? { preco: u.preco, fonte: 'MEU', data: u.data } : null;
+}
+// Preço normal + opção aplicada sozinha (só as que têm quantidade mínima) + dica "levando mais fica mais barato"
+function precoItem(S, pid, lid, q) {
+  const n = normalDe(S, pid, lid), ops = opcoesDe(S, pid, lid), normal = n ? n.preco : null;
+  const auto = ops.filter((o) => o.qtd_min && q >= o.qtd_min && (normal == null || o.preco < normal)).sort((a, b) => a.preco - b.preco)[0] || null;
+  const atual = auto ? auto.preco : normal;
+  const prox = ops.filter((o) => o.qtd_min && q < o.qtd_min && (atual == null || o.preco < atual)).sort((a, b) => a.qtd_min - b.qtd_min)[0] || null;
+  return { preco_normal: normal, fonte: n ? n.fonte : null, preco: atual, opcao: auto ? opcView(S, auto) : null, opcoes: ops.map((o) => opcView(S, o)),
+    dica: prox ? { rotulo: prox.rotulo, preco: prox.preco, qtd_min: prox.qtd_min, economia_unidade: atual != null ? r2(atual - prox.preco) : null } : null };
+}
+function sugPacote(S, pid, lid, q, unit) {
+  if (unit == null) return null;
+  let best = null;
+  for (const pk of S.produtos.filter((x) => x.contem_id === pid && x.status !== 'INATIVO' && x.contem_qtd > 1)) {
+    const n = pk.contem_qtd;
+    if (q < n) continue;
+    const pp = normalDe(S, pk.id, lid);
+    if (!pp) continue;
+    const qp = Math.floor(q / n), resto = r2(q - qp * n), total = r2(qp * pp.preco + resto * unit), eco = r2(q * unit - total);
+    if (eco > 0.004 && (!best || eco > best.economia)) best = { produto_id: pk.id, nome: pk.nome, contem_qtd: n, qtd_pacotes: qp, resto, preco_pacote: pp.preco, total, economia: eco };
+  }
+  return best;
+}
+// Itens digitados à mão que parecem o produto (o servidor nunca une sozinho)
+function parecidosDe(S, lista_id, p, excetoId) {
+  const pt = norm(p.nome).split(/[^a-z0-9]+/).filter(Boolean);
+  return S.listaItens.filter((i) => {
+    if (i.lista_id !== lista_id || i.produto_id || i.comprado || i.id === excetoId) return false;
+    const ws = norm(i.descricao).split(/[^a-z0-9]+/).filter((w) => w.length >= 3);
+    return ws.length && ws.every((w) => pt.some((t) => t.startsWith(w) || (t.length >= 4 && w.startsWith(t))));
+  }).map((i) => ({ id: i.id, descricao: i.descricao, quantidade: i.quantidade }));
+}
+function sessItem(S, s, li) {
+  const p = li.produto_id && prodOf(S, li.produto_id), x = p ? precoItem(S, p.id, s.loja_id, li.quantidade) : null;
+  return { id: nid('si'), lista_item_id: li.id, produto_id: li.produto_id, descricao: li.descricao, quantidade: li.quantidade, unidade: p ? p.unidade : 'UN', preco_sugerido: x ? x.preco : null, preco_unitario: x ? x.preco : null, rotulo: x && x.opcao ? x.opcao.rotulo : '', manual: false, marcado: false, categoria_id: p ? p.categoria_id : 'c_merc' };
+}
+function repreco(S, s, si) {
+  if (si.manual || !si.produto_id) return;
+  const x = precoItem(S, si.produto_id, s.loja_id, si.quantidade);
+  si.preco_unitario = x.preco; si.preco_sugerido = x.preco; si.rotulo = x.opcao ? x.opcao.rotulo : '';
+}
+// A compra aberta e a lista são a mesma coisa: o que entra em uma aparece na outra; o mesmo item nunca fica dobrado
+function syncSess(S, s) {
+  if (s.status !== 'ABERTA') return;
+  const lis = S.listaItens.filter((i) => i.lista_id === s.lista_id);
+  for (const si of s.itens) {
+    if (si.lista_item_id && lis.some((l) => l.id === si.lista_item_id)) continue;
+    if (si.lista_item_id) { si._fora = true; continue; }   // tirado da lista de propósito (remover, trocar por pacote): sai da compra também
+    const ex = si.produto_id && lis.find((l) => l.produto_id === si.produto_id && !l.comprado);
+    if (ex) { si.lista_item_id = ex.id; continue; }   // só compras antigas (itens sem item de lista) são reparadas
+    const li = { id: nid('lx'), lista_id: s.lista_id, produto_id: si.produto_id, descricao: si.descricao, quantidade: si.quantidade, comprado: false };
+    S.listaItens.push(li); lis.push(li); si.lista_item_id = li.id;
+  }
+  const seen = new Map();
+  s.itens = s.itens.filter((si) => {
+    if (si._fora) return false;
+    const o = seen.get(si.lista_item_id);
+    if (!o) { seen.set(si.lista_item_id, si); return true; }
+    o.marcado = o.marcado || si.marcado;
+    if (o.preco_unitario == null) o.preco_unitario = si.preco_unitario;
+    return false;
+  });
+  for (const li of lis.filter((l) => !l.comprado)) {
+    const si = seen.get(li.id);
+    if (!si) { s.itens.push(sessItem(S, s, li)); continue; }
+    const p = li.produto_id && prodOf(S, li.produto_id);
+    si.produto_id = li.produto_id; si.descricao = li.descricao; if (p) si.unidade = p.unidade;
+    if (si.quantidade !== li.quantidade) { si.quantidade = li.quantidade; repreco(S, s, si); }
+    else if (si.preco_unitario == null) repreco(S, s, si);
+  }
+}
+function sessItemView(S, s, si) {
+  const x = si.produto_id ? precoItem(S, si.produto_id, s.loja_id, si.quantidade) : null;
+  const { manual, _fora, ...v } = si;
+  return { ...clone(v), rotulo: si.rotulo || '', preco_normal: x ? x.preco_normal : null, opcoes: x ? x.opcoes : [], dica: x ? x.dica : null };
+}
+function pacoteCampos(S, x, p) {
+  if (p.contem_id === undefined && p.contem_qtd === undefined) return;
+  if (p.contem_id === '' || p.contem_id === null) { x.contem_id = null; x.contem_qtd = null; return; }
+  const c = prodOf(S, p.contem_id !== undefined ? p.contem_id : x.contem_id);
+  if (!c || c.status === 'INATIVO') fail('Escolha o produto que vem dentro do pacote.');
+  if (c.id === x.id) fail('O pacote não pode conter ele mesmo.');
+  if (c.contem_id) fail('O produto escolhido já é um pacote; escolha a unidade.');
+  if (x.id && S.produtos.some((y) => y.contem_id === x.id)) fail('Este produto está dentro de outro pacote e não pode virar pacote.');
+  const q = Number(p.contem_qtd !== undefined ? p.contem_qtd : x.contem_qtd);
+  if (!Number.isInteger(q) || q < 2 || q > 999) fail('Quantidade do pacote: um número inteiro de 2 a 999.');
+  x.contem_id = c.id; x.contem_qtd = q;
+}
+// ---------- deslocamento (pessoal: cada pessoa vê só o seu) ----------
+const COMBS = [['GASOLINA', 'Gasolina', 'litro'], ['ETANOL', 'Etanol', 'litro'], ['DIESEL', 'Diesel', 'litro'], ['GNV', 'GNV', 'm³'], ['ELETRICO', 'Energia elétrica', 'kWh']];
+const TIPOS_MODO = ['A_PE', 'ONIBUS', 'VEICULO', 'APP', 'OUTRO'], TIPOS_VEIC = ['CARRO', 'MOTO', 'OUTRO'];
+const ativoD = (x) => x.status !== 'INATIVO';
+const numOr = (v, d) => (v == null || v === '' ? d : Number(v));
+function seedDesl() {
+  return {
+    migrado: true, combustiveis: { GASOLINA: 6.29 },
+    enderecos: [
+      { id: 'en_casa', nome: 'Casa', endereco: 'Rua dos Mundurucus, 1200 · Batista Campos', latitude: -1.4552, longitude: -48.4883, padrao: true, status: 'ATIVO' },
+      { id: 'en_trab', nome: 'Trabalho', endereco: 'Av. Almirante Barroso, 900 · Marco', latitude: -1.4290, longitude: -48.4590, padrao: false, status: 'ATIVO' },
+    ],
+    veiculos: [
+      { id: 've_carro', nome: 'Carro da família', tipo: 'CARRO', combustivel: 'GASOLINA', consumo: 11.5, status: 'ATIVO' },
+      { id: 've_moto', nome: 'Moto do Rafael', tipo: 'MOTO', combustivel: 'ETANOL', consumo: 32, status: 'ATIVO' },
+    ],
+    modos: [
+      { id: 'mo_carro', nome: 'Carro da família', tipo: 'VEICULO', veiculo_id: 've_carro', tarifa: 0, custo_km: 0, padrao: true, status: 'ATIVO' },
+      { id: 'mo_pe', nome: 'A pé', tipo: 'A_PE', veiculo_id: null, tarifa: 0, custo_km: 0, padrao: false, status: 'ATIVO' },
+      { id: 'mo_bus', nome: 'Ônibus', tipo: 'ONIBUS', veiculo_id: null, tarifa: 5, custo_km: 0, padrao: false, status: 'ATIVO' },
+      { id: 'mo_app', nome: 'App de transporte', tipo: 'APP', veiculo_id: null, tarifa: 4.5, custo_km: 2.1, padrao: false, status: 'ATIVO' },
+      { id: 'mo_moto', nome: 'Moto do Rafael', tipo: 'VEICULO', veiculo_id: 've_moto', tarifa: 0, custo_km: 0, padrao: false, status: 'ATIVO' },
+    ],
+  };
+}
+function deslOf(S) {
+  DB.desl ||= {};
+  const k = DB.usuario.id;
+  const d = DB.desl[k] ||= { enderecos: [], veiculos: [], combustiveis: {}, modos: [], migrado: false };
+  if (!d.migrado) {
+    d.migrado = true;
+    const c = (S && S.config) || {};
+    if (c.casa_latitude != null && !d.enderecos.length) d.enderecos.push({ id: nid('en'), nome: 'Casa', endereco: null, latitude: c.casa_latitude, longitude: c.casa_longitude, padrao: true, status: 'ATIVO' });
+    if (c.custo_km > 0 && !d.modos.length) d.modos.push({ id: nid('mo'), nome: 'Carro (custo por km)', tipo: 'OUTRO', veiculo_id: null, tarifa: 0, custo_km: c.custo_km, padrao: true, status: 'ATIVO' });
+    save();
+  }
+  return d;
+}
+function viewModo(d, m) {
+  let tarifa = r2(m.tarifa || 0), custo_km = Number(m.custo_km || 0), incompleto = false;
+  if (m.tipo === 'A_PE') { tarifa = 0; custo_km = 0; }
+  else if (m.tipo === 'ONIBUS') custo_km = 0;
+  else if (m.tipo === 'VEICULO') {
+    tarifa = 0;
+    const v = d.veiculos.find((x) => x.id === m.veiculo_id), preco = v ? d.combustiveis[v.combustivel] : null;
+    if (v && v.consumo > 0 && preco > 0) custo_km = Math.round(preco / v.consumo * 10000) / 10000; else { custo_km = 0; incompleto = true; }
+  }
+  return { id: m.id, nome: m.nome, tipo: m.tipo, veiculo_id: m.veiculo_id || null, tarifa, custo_km, incompleto, padrao: !!m.padrao, status: m.status };
+}
+const combView = (d) => COMBS.map(([combustivel, nome, unidade]) => ({ combustivel, nome, unidade, preco: d.combustiveis[combustivel] ?? null }));
+function fixPadrao(list, escolhido) {
+  if (escolhido) list.forEach((x) => { x.padrao = x === escolhido; });
+  list.forEach((x) => { if (!ativoD(x)) x.padrao = false; });
+  if (!list.some((x) => x.padrao && ativoD(x))) { const f = list.find(ativoD); if (f) f.padrao = true; }
+}
+function comparar(S, p) {
+  const li = S.listas.find((l) => l.id === p.lista_id) || fail('Lista não encontrada.');
+  const its = S.listaItens.filter((i) => i.lista_id === li.id && !i.comprado);
+  if (!its.length) fail('A lista não tem itens pendentes.');
+  const cfg = S.config, dsl = deslOf(S), fator = cfg.fator_rota || 1.3;
+  let origem = null;
+  if (p.latitude != null && p.longitude != null) origem = { latitude: Number(p.latitude), longitude: Number(p.longitude), fonte: 'INFORMADA', nome: 'onde você está', endereco_id: null };
+  else {
+    const ends = dsl.enderecos.filter(ativoD);
+    const e = p.endereco_id ? ends.find((x) => x.id === p.endereco_id) || fail('Endereço não encontrado.') : ends.find((x) => x.padrao) || ends[0];
+    if (e) origem = { latitude: e.latitude, longitude: e.longitude, fonte: 'ENDERECO', nome: e.nome, endereco_id: e.id };
+    else if (cfg.casa_latitude != null) origem = { latitude: cfg.casa_latitude, longitude: cfg.casa_longitude, fonte: 'CASA', nome: 'Casa', endereco_id: null };
+  }
+  const ms = dsl.modos.filter(ativoD);
+  const m0 = p.modo_id ? ms.find((x) => x.id === p.modo_id) || fail('Transporte não encontrado.') : ms.find((x) => x.padrao) || ms[0];
+  const mv = m0 ? viewModo(dsl, m0) : null;
+  const modo = mv ? { id: mv.id, nome: mv.nome, tipo: mv.tipo, tarifa: mv.tarifa, custo_km: mv.custo_km, incompleto: mv.incompleto } : null;
+  const lat = origem ? origem.latitude : null, lng = origem ? origem.longitude : null;
+  let lojas = S.lojas.filter((l) => l.status !== 'INATIVA');
+  if (p.incluir_compartilhadas !== false) lojas = lojas.concat(DB.lojasGlobais);
+  if (p.loja_ids && p.loja_ids.length) lojas = lojas.filter((l) => p.loja_ids.includes(l.id));
+  const best = (it) => { let b = null; for (const l of lojas) { const x = it.produto_id && precoEm(S, it.produto_id, l.id); if (x && (!b || x.preco < b.preco)) b = { ...x, loja_id: l.id }; } return b; };
+  const out = lojas.map((l) => {
+    let conh = 0, est = 0, n = 0; const falt = [], itens = [];
+    its.forEach((it) => {
+      const x = it.produto_id && precoEm(S, it.produto_id, l.id);
+      if (x) { n++; conh += x.preco * it.quantidade; itens.push({ item_id: it.id, descricao: it.descricao, quantidade: it.quantidade, preco: x.preco, subtotal: r2(x.preco * it.quantidade), fonte: x.fonte }); }
+      else { const b = best(it); falt.push(it.descricao); if (b) est += b.preco * it.quantidade; itens.push({ item_id: it.id, descricao: it.descricao, quantidade: it.quantidade, preco: b ? b.preco : null, subtotal: b ? r2(b.preco * it.quantidade) : null, fonte: b ? 'ESTIMADO' : null }); }
+    });
+    const temGeo = l.latitude != null && lat != null;
+    const dist = temGeo ? r2(hav(lat, lng, l.latitude, l.longitude)) : null, km1 = temGeo ? dist * fator : null, desl = temGeo ? r2(km1 * 2) : null, custo = temGeo && mv && !mv.incompleto ? r2(2 * (mv.tarifa + mv.custo_km * km1)) : 0;
+    return { loja_id: l.id, nome: l.nome, compartilhada: !!l.global, total_conhecido: r2(conh), total_estimado: r2(conh + est), cobertura: r2(n / its.length), itens_faltantes: falt, distancia_km: dist, deslocamento_km: desl, custo_deslocamento: custo, total_final: r2(conh + est + custo), itens };
+  }).filter((l) => l.cobertura > 0 && (!p.raio_km || l.distancia_km == null || l.distancia_km <= p.raio_km)).sort((a, b) => (a.cobertura < 0.5) - (b.cobertura < 0.5) || a.total_final - b.total_final);
+  if (!out.length) return { origem, modo, lojas: [], melhor: null, economia_vs_pior: 0, compra_dividida: null };
+  const grupos = {};
+  its.forEach((it) => { const b = best(it); if (!b) return; const lo = out.find((x) => x.loja_id === b.loja_id); if (!lo) return; (grupos[b.loja_id] ||= { loja_id: b.loja_id, nome: lo.nome, itens: [], subtotal: 0, custo_deslocamento: lo.custo_deslocamento }); grupos[b.loja_id].itens.push({ item_id: it.id, descricao: it.descricao, quantidade: it.quantidade, preco: b.preco, subtotal: r2(b.preco * it.quantidade) }); grupos[b.loja_id].subtotal = r2(grupos[b.loja_id].subtotal + b.preco * it.quantidade); });
+  const gs = Object.values(grupos), tot = r2(gs.reduce((s, g) => s + g.subtotal, 0)), cd = r2(gs.reduce((s, g) => s + g.custo_deslocamento, 0));
+  return { origem, modo, lojas: out, melhor: out[0].loja_id, economia_vs_pior: r2(Math.max(0, Math.max(...out.filter((l) => l.cobertura >= 0.5).map((l) => l.total_final), out[0].total_final) - out[0].total_final)),
+    compra_dividida: gs.length > 1 ? { lojas: gs, total: tot, custo_deslocamento: cd, total_final: r2(tot + cd), economia_vs_melhor: r2(out[0].total_final - tot - cd) } : null };
+}
+function sessaoView(S, s) { const l = lojaOf(S, s.loja_id); return { ...clone(s), itens: s.itens.map((i) => sessItemView(S, s, i)), loja: l ? { id: l.id, nome: l.nome } : null, lista_nome: (S.listas.find((x) => x.id === s.lista_id) || {}).nome || '' }; }
+function registrarPreco(S, pid, lid, preco, data, origem, chave) {
+  S.precos.push({ id: nid('pr'), produto_id: pid, loja_id: lid, preco: r2(preco), data: data || T, origem, chave_nfce: chave || null });
+  const p = prodOf(S, pid), l = lojaOf(S, lid);
+  if (!S.config.compartilhar_precos || !p || !p.gtin || !l || !l.cnpj) return { publicado: false, status: null };
+  const outros = DB.obs.filter((o) => o.gtin === p.gtin && o.status !== 'rejeitado').map((o) => o.preco).sort((a, b) => a - b);
+  const med = outros.length ? outros[Math.floor(outros.length / 2)] : preco;
+  const status = chave ? 'validado' : preco < med / 2 || preco > med * 2 ? 'suspeito' : 'observado';
+  DB.obs.push({ observacao_id: nid('ob'), gtin: p.gtin, cnpj: l.cnpj, loja: { nome: l.nome, cidade: l.cidade, uf: l.uf }, preco: r2(preco), data: data || T, origem: chave ? 'nfce' : 'manual', status, confirmacoes: 0, discordancias: 0, minha: true, meu_voto: null, escondido: false });
+  DB.reputacao.observacoes++;
+  return { publicado: true, status };
+}
+
+// ---------- NFC-e ----------
+const brNum = (s) => Number(String(s).replace(/\./g, '').replace(',', '.'));
+function interpretar(S, entrada, texto) {
+  const m = String(entrada || '').match(/\d{44}/), avisos = [];
+  const chave = m ? m[0] : null;
+  let info = null;
+  if (chave) {
+    info = { uf: chave.slice(0, 2), aamm: chave.slice(2, 6), cnpj: chave.slice(6, 20), modelo: chave.slice(20, 22), nfce: chave.slice(20, 22) === '65', dv_ok: dv11(chave.slice(0, 43)) === Number(chave[43]) };
+    if (!info.dv_ok) avisos.push('O dígito verificador da chave não confere.');
+  }
+  const itens = [], tx = String(texto || '');
+  const re = /^(.+?)\s*\(C[óo]digo:\s*(\w+)\s*\)\s*\n\s*Qtde\.:\s*([\d.,]+)\s*UN:\s*([A-Za-z]+)\d*\s*Vl\. Unit\.:\s*([\d.,]+)\s*Vl\. Total\s*\n\s*([\d.,]+)/gm;
+  let x;
+  while ((x = re.exec(tx))) {
+    const un = /^K/i.test(x[4]) ? 'KG' : /^L/i.test(x[4]) ? 'L' : 'UN';
+    const desc = x[1].trim(), cod = x[2];
+    itens.push({ descricao: desc, codigo: cod, quantidade: brNum(x[3]), unidade: un, preco_unitario: brNum(x[5]), total: brNum(x[6]), produto_sugerido_id: null, motivo_sugestao: '' });
+  }
+  const cnpjM = tx.match(/CNPJ:\s*([\d./-]+)/), cnpj = cnpjM ? cnpjM[1].replace(/\D/g, '') : info ? info.cnpj : null;
+  const linhas = tx.split('\n').map((s) => s.trim());
+  const iC = linhas.findIndex((s) => /^CNPJ:/.test(s));
+  const emitente = iC > 0 ? linhas.slice(0, iC).filter(Boolean).pop() : null;
+  const end = iC >= 0 && linhas[iC + 1] ? linhas[iC + 1].split(',').map((s) => s.trim()).filter(Boolean) : [];
+  const totM = tx.match(/Valor a pagar R\$:\s*\n?\s*([\d.,]+)/), dataM = tx.match(/Emiss[ãa]o:\s*(\d{2})\/(\d{2})\/(\d{4})/);
+  const loja = cnpj && S.lojas.find((l) => l.cnpj === cnpj);
+  itens.forEach((it) => {
+    const ap = cnpj && S.apelidos[cnpj + ':' + it.codigo];
+    if (ap) { it.produto_sugerido_id = ap; it.motivo_sugestao = 'codigo'; return; }
+    const w = norm(it.descricao).split(/\W+/).filter((s) => s.length > 2);
+    let b = null, bs = 0;
+    S.produtos.forEach((p) => { const pn = norm(p.nome + ' ' + (p.marca || '')); const sc = w.filter((t) => pn.includes(t)).length; if (sc > bs) { bs = sc; b = p; } });
+    if (b && bs >= 2) { it.produto_sugerido_id = b.id; it.motivo_sugestao = 'nome'; }
+  });
+  if (!chave) avisos.push('Sem a chave de acesso, os preços entram como não verificados.');
+  if (!itens.length) avisos.push(tx ? 'Não foi possível reconhecer os itens neste texto.' : 'Copie o texto da página da nota (ou envie o PDF) para ler os itens.');
+  const total = totM ? brNum(totM[1]) : r2(itens.reduce((s, i) => s + i.total, 0));
+  return { chave, chave_info: info, cnpj, duplicada: !!(chave && S.notas.some((n) => n.chave === chave)), loja_id: loja ? loja.id : null, emitente,
+    data: dataM ? `${dataM[3]}-${dataM[2]}-${dataM[1]}` : null, total, endereco: end.length >= 2 ? { cidade: end[end.length - 2].replace(/^./, (c) => c.toUpperCase()).toLowerCase().replace(/^./, (c) => c.toUpperCase()), uf: end[end.length - 1] } : null, itens, avisos };
+}
+export function amostraNota() {
+  const cnpj = '11222333000181', base = '15' + T.slice(2, 4) + T.slice(5, 7) + cnpj + '65' + '501' + '000' + String(470000 + Math.floor(Math.random() * 9999)).padStart(6, '0') + '1' + '04857917';
+  const chave = base + dv11(base);
+  const d = T.split('-').reverse().join('/');
+  const its = [['ARROZ BOM GRAO T1 5KG', '10231', '1', 'UND', '25,90', '25,90'], ['CAFE SERRA AZUL 500G', '10877', '2', 'UND', '18,49', '36,98'], ['LEITE INTEGRAL VALE DOCE 1L', '20114', '6', 'UND', '4,99', '29,94'],
+    ['BANANA PRATA KG', '30017', '1,235', 'KG', '6,49', '8,02'], ['DETERGENTE NEUTRO BRILHO 500ML', '40512', '3', 'UND', '2,59', '7,77'], ['BISCOITO RECHEADO CHOCOLATE 130G', '50981', '2', 'UND', '3,49', '6,98']];
+  const total = its.reduce((s, i) => s + brNum(i[5]), 0);
+  const texto = 'DOCUMENTO AUXILIAR DA NOTA FISCAL DE CONSUMIDOR ELETRÔNICA\n\nSUPERMERCADO BOM PRECO LTDA\nCNPJ: 11.222.333/0001-81\nAV. DAS FLORES , 1200 , , CENTRO , BELEM , PA\n' +
+    its.map((i) => `${i[0]} (Código: ${i[1]} )\nQtde.:${i[2]}UN: ${i[3]}9Vl. Unit.:   ${i[4]}\tVl. Total\n${i[5]}\n`).join('') +
+    `Qtd. total de itens:\n${its.length}\nValor a pagar R$:\n${total.toFixed(2).replace('.', ',')}\nForma de pagamento:\nCartão de Crédito\n\nNúmero: 473340 Série: 501 Emissão: ${d} 19:42:10 - Via Consumidor\n`;
+  return { entrada: 'https://nfce.exemplo.gov.br/consulta?p=' + chave + '|2|1|1|ABCDEF', texto };
+}
+
+// ---------- rotas ----------
+const ADMIN_WS = new Set(['ws.renomear', 'ws.resumo', 'ws.arquivar', 'membros.listar', 'membros.convidar', 'membros.remover', 'convites.enviados', 'convites.cancelar', 'exportar.espaco', 'config.salvar', 'integridade.verificar']);
+const LEITURA_WRITES = new Set(['enderecos.salvar', 'veiculos.salvar', 'combustiveis.salvar', 'modos.salvar', 'notificacoes.preferencias_salvar', 'precos.confirmar', 'denuncias.criar', 'perfil.salvar', 'ws.criar', 'ws.listar', 'ws.arquivados', 'ws.desarquivar']);
+const RANK = { leitura: 1, editor: 2, admin: 3 };
+const R = {
+  'auth.pedir': ({ email }) => { if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email || '')) fail('Confira o e-mail.'); return { enviado: true, validade_min: 10 }; },
+  'auth.confirmar': ({ email, codigo }) => { if (!/^\d{6}$/.test(codigo || '') || codigo === '000000') fail('Código inválido ou expirado.'); DB.usuario.email = email; DB.logado = true; flags.expirar = false; sset(FK, flags); return { token: 'demo.' + Math.random().toString(36).slice(2), email }; },
+  'sistema.iniciar': () => { flags.semBanco = false; sset(FK, flags); return { banco: 'Nexora — Banco de dados (demonstração)', usuario: DB.usuario }; },
+  'ws.listar': () => DB.spaces.map((s) => ({ id: s.id, nome: s.nome, papel: s.papel })),
+  'ws.criar': ({ nome }) => { if (!String(nome || '').trim()) fail('Dê um nome ao espaço.'); flags.contaNova = false; sset(FK, flags); const S = baseSpace(nid('ws'), nome.trim(), 'admin'); S.produtos = []; S.listaItens = []; DB.spaces.push(S); return { id: S.id, nome: S.nome }; },
+  'ws.resumo': (p, { S }) => {
+    const conteudo = {}; ['recursos', 'lancamentos', 'recorrencias', 'planejamentos', 'produtos', 'lojas', 'listas', 'sessoes', 'notas'].forEach((k) => { if ((S[k] || []).length) conteudo[k] = S[k].length; });
+    return { vazio: !Object.keys(conteudo).length, lancamentos: (S.lancamentos || []).length, conteudo, membros: S.membros.length, outros_espacos: DB.spaces.filter((x) => x.id !== S.id).length };
+  },
+  'ws.arquivar': (p, { S }) => {
+    const r = R['ws.resumo'](p, { S }); if (!r.outros_espacos) fail('Você precisa ter pelo menos outro espaço ativo antes de arquivar ou excluir este.');
+    DB.spaces = DB.spaces.filter((x) => x.id !== S.id); if (!r.vazio) DB.arquivados = (DB.arquivados || []).concat(S);
+    return { acao: r.vazio ? 'EXCLUIDO' : 'ARQUIVADO', proximo_espaco_id: DB.spaces[0].id };
+  },
+  'ws.arquivados': () => (DB.arquivados || []).filter((s) => s.papel === 'admin').map((s) => ({ id: s.id, nome: s.nome })),
+  'ws.desarquivar': ({ espaco_id }) => {
+    const s = (DB.arquivados || []).find((x) => x.id === espaco_id && x.papel === 'admin'); if (!s) fail('Espaço arquivado não encontrado (só o admin do espaço pode reativá-lo, e espaços excluídos não voltam).');
+    DB.arquivados = DB.arquivados.filter((x) => x !== s); DB.spaces.push(s); return { id: s.id, nome: s.nome };
+  },
+  'ws.renomear': ({ nome }, { S }) => { if (!String(nome || '').trim()) fail('Dê um nome ao espaço.'); S.nome = nome.trim(); return { id: S.id, nome: S.nome }; },
+  'membros.listar': (p, { S }) => clone(S.membros),
+  'membros.convidar': ({ email, papel }, { S }) => {
+    email = String(email || '').trim().toLowerCase();
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) fail('Confira o e-mail.');
+    if (!RANK[papel]) fail('Escolha o papel.');
+    const ex = S.membros.find((m) => m.email === email);
+    if (ex) {
+      if (ex.papel === 'admin' && papel !== 'admin' && S.membros.filter((m) => m.papel === 'admin').length < 2) fail('O espaço precisa de ao menos um administrador.');
+      ex.papel = papel;
+      notificar(email, { tipo: 'PAPEL_ALTERADO', titulo: 'Seu papel mudou', texto: `Agora você é ${PAPEL_TXT[papel]} no espaço ${S.nome}.`, espaco_id: S.id });
+      return { email, papel, status: 'MEMBRO' };
+    }
+    const conta_existe = (DB.admin.usuarios || []).some((u) => u.email === email);
+    if (!DB.admin.cadastro_aberto && !conta_existe) fail('O cadastro de novos usuários está fechado: só é possível convidar quem já tem cadastro.');
+    S.convites = S.convites || [];
+    const expira_em = addDays(T, 14);
+    let cv = S.convites.find((c) => c.email === email && c.status === 'PENDENTE');
+    if (cv) { cv.papel = papel; cv.expira_em = expira_em; cv.criado_em = now(); }
+    else { cv = { id: nid('cv'), espaco_id: S.id, espaco_nome: S.nome, email, papel, status: 'PENDENTE', convidado_por_nome: DB.usuario.nome, expira_em, respondido_em: null, criado_em: now() }; S.convites.push(cv); }
+    const email_enviado = !/sememail/.test(email);
+    if (conta_existe) notificar(email, { tipo: 'CONVITE_RECEBIDO', titulo: `Convite para o espaço ${S.nome}`, texto: `${DB.usuario.nome} convidou você como ${PAPEL_TXT[papel]}.`, ref_id: cv.id, espaco_id: S.id });
+    return { email, papel, status: 'PENDENTE', convite_id: cv.id, expira_em, conta_existe, email_enviado };
+  },
+  'convites.enviados': (p, { S }) => (S.convites || []).map((c) => ({ ...clone(c), status: c.status === 'PENDENTE' && c.expira_em < T ? 'EXPIRADO' : c.status })).sort((a, b) => (a.criado_em < b.criado_em ? 1 : -1)),
+  'convites.cancelar': ({ id }, { S }) => { const c = (S.convites || []).find((x) => x.id === id) || fail('Convite não encontrado.'); if (c.status !== 'PENDENTE') fail('Só dá para cancelar convites pendentes.'); c.status = 'CANCELADO'; c.respondido_em = now(); return { id, status: 'CANCELADO' }; },
+  'convites.recebidos': () => (DB.convitesRecebidos || []).filter((c) => c.status === 'PENDENTE' && c.expira_em >= T).map(clone).sort((a, b) => (a.criado_em < b.criado_em ? 1 : -1)),
+  'convites.aceitar': ({ id }) => {
+    const cv = (DB.convitesRecebidos || []).find((c) => c.id === id);
+    if (!cv || cv.status !== 'PENDENTE') fail('Este convite não está mais disponível.');
+    if (cv.expira_em < T) { cv.status = 'EXPIRADO'; fail('Este convite expirou. Peça um novo a quem convidou.'); }
+    cv.status = 'ACEITO'; cv.respondido_em = now();
+    flags.contaNova = false; sset(FK, flags);
+    let S = DB.spaces.find((s) => s.id === cv.espaco_id);
+    if (!S) { S = (DB.spacesConvite || {})[cv.espaco_id] || baseSpace(cv.espaco_id, cv.espaco_nome, cv.papel); if (DB.spacesConvite) delete DB.spacesConvite[cv.espaco_id]; DB.spaces.push(S); }
+    S.papel = cv.papel;
+    if (!S.membros.some((m) => m.email === DB.usuario.email)) S.membros.push({ usuario_id: DB.usuario.id, email: DB.usuario.email, nome: DB.usuario.nome, papel: cv.papel });
+    (DB.notificacoes || []).forEach((n) => { if (n.ref_id === id) n.lida = true; });
+    return { espaco_id: S.id, espaco_nome: S.nome, papel: cv.papel };
+  },
+  'convites.recusar': ({ id }) => { const cv = (DB.convitesRecebidos || []).find((c) => c.id === id); if (!cv || cv.status !== 'PENDENTE') fail('Este convite não está mais disponível.'); cv.status = 'RECUSADO'; cv.respondido_em = now(); (DB.notificacoes || []).forEach((n) => { if (n.ref_id === id) n.lida = true; }); return { id, status: 'RECUSADO' }; },
+  'notificacoes.listar': ({ so_nao_lidas, limite } = {}) => { const all = (DB.notificacoes || []).slice().sort((a, b) => (a.criada_em < b.criada_em ? 1 : -1)); const itens = (so_nao_lidas ? all.filter((n) => !n.lida) : all).slice(0, Math.min(100, limite || 30)).map(clone); return { itens, nao_lidas: all.filter((n) => !n.lida).length, total: all.length }; },
+  'notificacoes.preferencias': () => prefsView(),
+  'notificacoes.preferencias_salvar': ({ tipos } = {}) => {
+    if (!tipos || typeof tipos !== 'object' || Array.isArray(tipos)) fail('Informe os tipos de aviso.');
+    for (const k of Object.keys(tipos)) if (!PREF_TIPOS.some((t) => t.tipo === k)) fail('Tipo de aviso inválido: ' + k + '.');
+    for (const k of Object.keys(tipos)) prefsDe()[k] = !!tipos[k];
+    return prefsView();
+  },
+  'notificacoes.contar': () => ({ nao_lidas: (DB.notificacoes || []).filter((n) => !n.lida).length }),
+  'notificacoes.marcar_lida': ({ id, todas }) => { let marcadas = 0; (DB.notificacoes || []).forEach((n) => { if ((todas || n.id === id) && !n.lida) { n.lida = true; marcadas++; } }); return { marcadas, nao_lidas: (DB.notificacoes || []).filter((n) => !n.lida).length }; },
+  'membros.remover': ({ usuario_id }, { S }) => { const m = S.membros.find((x) => x.usuario_id === usuario_id) || fail('Pessoa não encontrada.'); if (m.papel === 'admin' && S.membros.filter((x) => x.papel === 'admin').length < 2) fail('O espaço precisa de ao menos uma pessoa admin.'); S.membros = S.membros.filter((x) => x !== m); return { ok: true }; },
+  'perfil.ler': () => perfilView(),
+  'perfil.cpf': () => ({ cpf: perfilDe().cpf || '' }),
+  'perfil.salvar': (p) => {
+    const pf = perfilDe(), dg = (s) => String(s == null ? '' : s).replace(/\D/g, '');
+    if (p.nome !== undefined) { const n = String(p.nome || '').trim(); if (!n) fail('Informe seu nome.'); if (n.length > 60) fail('O nome pode ter até 60 caracteres.'); DB.usuario.nome = n; }
+    if (p.cpf !== undefined) { const c = dg(p.cpf); if (c && !cpfOk(c)) fail('CPF inválido. Confira os números.'); pf.cpf = c; }
+    if (p.telefone !== undefined) { const t = dg(p.telefone); if (t && !/^\d{10,11}$/.test(t)) fail('Telefone inválido. Informe o DDD e o número.'); pf.telefone = t; }
+    if (p.nascimento !== undefined) {
+      const n = String(p.nascimento || '').trim();
+      if (n && !(/^\d{4}-\d{2}-\d{2}$/.test(n) && n >= '1900-01-01' && n <= T && new Date(n + 'T12:00:00').toISOString().slice(0, 10) === n)) fail('Data de nascimento inválida.');
+      pf.nascimento = n;
+    }
+    if (p.avatar !== undefined) { const a = p.avatar ? String(p.avatar) : ''; if (a && !(/^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(a) && a.length <= 45000)) fail('Foto inválida ou grande demais.'); pf.avatar = a || null; }
+    return perfilView();
+  },
+  bootstrap: (p, { S }) => {
+    gerarRec(S, addDays(T, 35));
+    const saldos = {};
+    S.recursos.forEach((r) => { saldos[r.id] = { saldo_atual: saldo(S, r.id), saldo_projetado: saldo(S, r.id, { proj: true }) }; });
+    return { usuario: DB.usuario, espaco: { id: S.id, nome: S.nome, papel: S.papel }, espacos: R['ws.listar'](), hoje: T, recursos: S.recursos.filter((r) => r.status !== 'INATIVO').concat(S.recursos.filter((r) => r.status === 'INATIVO')), categorias: S.categorias, saldos, config: S.config };
+  },
+  'exportar.espaco': (p, { S }) => ({ tabelas: { recursos_financeiros: S.recursos, lancamentos: S.lancamentos, categorias: S.categorias, recorrencias: S.recorrencias, planejamentos: S.planejamentos, produtos: S.produtos.map(({ _base, ...x }) => x), lojas: S.lojas, precos: S.precos, listas: S.listas, itens_lista: S.listaItens, sessoes: S.sessoes, auditoria: S.auditoria } }),
+  'recursos.listar': ({ todos }, { S }) => S.recursos.filter((r) => todos || r.status !== 'INATIVO').map((r) => ({ ...r, ...(r.tipo === 'CARTAO' ? situacaoCartao(S, r.id) : { saldo_atual: saldo(S, r.id), saldo_projetado: saldo(S, r.id, { proj: true }) }) })),
+  'recursos.criar': (p, { S }) => {
+    if (!['CONTA', 'CARTEIRA', 'CARTAO'].includes(p.tipo)) fail('Escolha o tipo.');
+    if (!String(p.nome || '').trim()) fail('Dê um nome.');
+    const r = { id: nid('r'), tipo: p.tipo, nome: p.nome.trim(), status: 'ATIVO', versao: 1, versao_recurso: 1 };
+    if (p.tipo === 'CARTAO') {
+      if (!(p.dia_fechamento >= 1 && p.dia_fechamento <= 31) || !(p.dia_vencimento >= 1 && p.dia_vencimento <= 31)) fail('Informe os dias de fechamento e vencimento.');
+      Object.assign(r, { limite: r2(p.limite), dia_fechamento: p.dia_fechamento, dia_vencimento: p.dia_vencimento, instituicao: p.instituicao || null, bandeira: p.bandeira || null, final: p.final || null, regra_fechamento: p.regra_fechamento || 'INCLUSIVO', recurso_pagamento_id: p.recurso_pagamento_id || null, anuidade: r2(p.anuidade), taxa_juros: Number(p.taxa_juros) || 0 });
+    } else Object.assign(r, { tipo_conta: p.tipo_conta || null, instituicao: p.instituicao || null, agencia: p.agencia || null, numero: p.numero || null, saldo_inicial: r2(p.saldo_inicial), data_saldo_inicial: p.data_saldo_inicial || T });
+    if (p.tipo === 'CONTA') contaCampos(r, p);
+    r.data_criacao = T;
+    S.recursos.push(r);
+    if (r.tipo === 'CONTA') { if (r.cheque_especial) histAdd(S, r, 'limite_cheque', '', String(r.limite_cheque)); if (r.juros_cheque > 0) histAdd(S, r, 'juros_cheque', '', String(r.juros_cheque)); if (r.taxa_rendimento > 0) histAdd(S, r, 'taxa_rendimento', '', String(r.taxa_rendimento)); }
+    if (r.tipo === 'CARTAO' && r.limite > 0) histAdd(S, r, 'limite', '', String(r.limite));
+    if (r.tipo !== 'CARTAO' && r.saldo_inicial > 0) criarLanc(S, { tipo: 'ENTRADA', descricao: 'Saldo inicial', valor_bruto: r.saldo_inicial, data_evento: r.data_saldo_inicial, status: 'EFETIVADO', recurso_id: r.id }, { origem: 'SALDO_INICIAL' });
+    return r;
+  },
+  'recursos.atualizar': (p, { S }) => {
+    const r = recOf(S, p.id) || fail('Recurso não encontrado.');
+    checkVer(r, p.versao);
+    const antes = {}; HIST_CAMPOS.forEach((k) => { antes[k] = histVal(r, k); });
+    ['nome', 'instituicao', 'agencia', 'numero', 'tipo_conta', 'limite', 'dia_fechamento', 'dia_vencimento', 'bandeira', 'final', 'regra_fechamento', 'recurso_pagamento_id', 'anuidade', 'taxa_juros'].forEach((k) => { if (p[k] !== undefined) r[k] = p[k]; });
+    if (r.tipo === 'CONTA') contaCampos(r, p);
+    HIST_CAMPOS.forEach((k) => { const v = histVal(r, k); if (v !== antes[k]) histAdd(S, r, k, antes[k], v); });
+    r.versao++; r.versao_recurso++;
+    return r;
+  },
+  'recursos.inativar': ({ id }, { S }) => { const r = recOf(S, id) || fail('Recurso não encontrado.'); if (Math.abs(saldo(S, id, { proj: true })) > 0.004) fail('Só é possível inativar com saldo zero.'); histAdd(S, r, 'status', 'ATIVO', 'INATIVO'); r.status = 'INATIVO'; r.versao++; return r; },
+  'categorias.listar': (p, { S }) => S.categorias,
+  'categorias.salvar': (p, { S }) => {
+    if (p.id) { const c = S.categorias.find((x) => x.id === p.id) || fail('Categoria não encontrada.'); if (p.nome && p.nome.trim() !== c.nome) { histAdd(S, { id: c.id, entidade: 'categoria' }, 'nome', c.nome, p.nome.trim()); c.nome = p.nome.trim(); } if (p.status && p.status !== c.status) { histAdd(S, { id: c.id, entidade: 'categoria' }, 'status', c.status, p.status); c.status = p.status; } return c; }
+    if (!String(p.nome || '').trim()) fail('Dê um nome.');
+    if (S.categorias.some((c) => norm(c.nome) === norm(p.nome) && c.tipo === p.tipo && (c.pai_id || null) === (p.pai_id || null))) fail('Já existe uma categoria com esse nome.');
+    const c = { id: nid('c'), nome: p.nome.trim(), tipo: p.tipo === 'RECEITA' ? 'RECEITA' : 'DESPESA', pai_id: p.pai_id || null, status: 'ATIVA' };
+    S.categorias.push(c); return c;
+  },
+  'lancamentos.criar': (p, { S }) => { const l = criarLanc(S, p); chequeConferir(S, l); return viewL(S, l, true); },
+  'lancamentos.listar': (p, { S }) => {
+    const t = norm(p.texto), lim = Math.min(200, p.limite || 30), off = p.offset || 0;
+    const catSet = p.categoria_id ? new Set(S.categorias.filter((c) => ancestors(S, c.id).includes(p.categoria_id)).map((c) => c.id)) : null;
+    const f = S.lancamentos.filter((l) => (!p.de || l.data_evento >= p.de) && (!p.ate || l.data_evento <= p.ate) && (!p.tipo || l.tipo === p.tipo) && (!p.status || l.status === p.status)
+      && (!catSet || catSet.has(l.categoria_id) || l.itens.some((i) => catSet.has(i.categoria_id))) && (!p.recurso_id || l.movimentacoes.some((m) => m.recurso_id === p.recurso_id))
+      && (!t || norm(l.descricao).includes(t) || l.itens.some((i) => norm(i.descricao).includes(t))))
+      .sort((a, b) => (a.data_evento === b.data_evento ? (a.criado_em < b.criado_em ? 1 : -1) : a.data_evento < b.data_evento ? 1 : -1));
+    return { total: f.length, offset: off, itens: f.slice(off, off + lim).map((l) => viewL(S, l)) };
+  },
+  'lancamentos.detalhe': ({ id }, { S }) => viewL(S, findL(S, id), true),
+  'lancamentos.historico': ({ id }, { S }) => { findL(S, id); return S.auditoria.filter((a) => a.entidade_id === id).sort((a, b) => (a.quando < b.quando ? 1 : -1)); },
+  'lancamentos.atualizar': (p, { S }) => {
+    const l = findL(S, p.id);
+    checkVer(l, p.versao);
+    if (['CANCELADO', 'ESTORNADO'].includes(l.status)) fail('Este lançamento não pode mais ser alterado.');
+    const mud = {};
+    const set = (k, v) => { if (v !== undefined && v !== l[k]) { mud[k] = [l[k], v]; l[k] = v; } };
+    set('descricao', p.descricao); set('categoria_id', p.categoria_id);
+    if (p.cobranca_banco !== undefined && !!p.cobranca_banco !== !!l.cobranca_banco) { if (p.cobranca_banco && !cobrancaOk(S, l)) fail('"Cobrança do banco" vale só para saída de conta.'); set('cobranca_banco', !!p.cobranca_banco); }
+    const futuro = ['PLANEJADO', 'PENDENTE'].includes(l.status);
+    if (['data_evento', 'valor_bruto', 'descontos', 'acrescimos', 'encargos'].some((k) => p[k] !== undefined && p[k] !== l[k])) {
+      if (!futuro || l.itens.length || l.parcelas.length) fail('Valor e data só mudam em lançamento futuro sem itens.');
+      ['data_evento', 'valor_bruto', 'descontos', 'acrescimos', 'encargos'].forEach((k) => set(k, p[k] != null ? (k === 'data_evento' ? p[k] : r2(p[k])) : undefined));
+      l.valor_total = r2(l.valor_bruto - l.descontos + l.acrescimos + l.encargos);
+      l.movimentacoes.forEach((m) => { m.valor = l.valor_total; });
+    }
+    (p.itens || []).forEach((x) => { const it = l.itens.find((i) => i.id === x.id); if (it && x.categoria_id && x.categoria_id !== it.categoria_id) { mud['item:' + it.descricao] = [it.categoria_id, x.categoria_id]; it.categoria_id = x.categoria_id; } });
+    l.versao++;
+    audit(S, l.id, 'atualizado', mud);
+    return viewL(S, l, true);
+  },
+  'lancamentos.efetivar': ({ id, data, cobranca_banco }, { S }) => {
+    const l = findL(S, id);
+    if (!['PLANEJADO', 'PENDENTE'].includes(l.status)) fail('Só lançamentos futuros podem ser efetivados.');
+    if (cobranca_banco !== undefined) { if (cobranca_banco && !cobrancaOk(S, l)) fail('"Cobrança do banco" vale só para saída de conta.'); l.cobranca_banco = !!cobranca_banco; }
+    const d = data || T;
+    l.status = 'EFETIVADO'; l.data_efetivacao = d; l.data_evento = d; parcelar(S, l, true);
+    l.movimentacoes.forEach((m) => { m.data_efetivacao = d; });
+    l.versao++; audit(S, l.id, 'efetivado', { status: ['PENDENTE', 'EFETIVADO'] });
+    chequeConferir(S, l);
+    return viewL(S, l, true);
+  },
+  'lancamentos.cancelar': ({ id }, { S }) => {
+    const l = findL(S, id);
+    if (!['PLANEJADO', 'PENDENTE'].includes(l.status)) fail('Só é possível cancelar o que ainda não aconteceu. Use estornar.');
+    audit(S, l.id, 'cancelado', { status: [l.status, 'CANCELADO'] });
+    l.status = 'CANCELADO'; l.versao++;
+    return viewL(S, l, true);
+  },
+  'lancamentos.estornar': ({ id, motivo, data }, { S }) => viewL(S, estornar(S, findL(S, id), motivo, data), true),
+  'cartoes.situacao': ({ recurso_id }, { S }) => { const k = recOf(S, recurso_id); if (!k || k.tipo !== 'CARTAO') fail('Cartão não encontrado.'); return situacaoCartao(S, recurso_id); },
+  'faturas.listar': ({ recurso_id }, { S }) => S.recursos.filter((k) => k.tipo === 'CARTAO' && (!recurso_id || k.id === recurso_id)).flatMap((k) => faturasDe(S, k.id).map(resumoFat)),
+  'faturas.detalhe': ({ id }, { S }) => faturasDe(S, id.split('~')[0]).find((f) => f.id === id) || fail('Fatura não encontrada.'),
+  'faturas.pagar': ({ fatura_id, recurso_id, valor, data }, { S }) => {
+    const kid = fatura_id.split('~')[0], f = faturasDe(S, kid).find((x) => x.id === fatura_id) || fail('Fatura não encontrada.');
+    if (f.status === 'ABERTA') fail('A fatura ainda está aberta; pague depois do fechamento.');
+    if (f.status === 'PAGA') fail('Esta fatura já está paga.');
+    const d = data || T;
+    if (d > T) fail('A data do pagamento não pode ser futura.');
+    const v = r2(valor != null ? valor : f.valor_em_aberto);
+    if (!(v > 0)) fail('Informe o valor.');
+    if (v > f.valor_em_aberto + 0.004) fail('O valor é maior que o saldo em aberto da fatura.');
+    const conta = recurso_id || recOf(S, kid).recurso_pagamento_id || fail('Escolha a conta de pagamento.');
+    pagarFatura(S, f, conta, v, d);
+    return faturasDe(S, kid).find((x) => x.id === fatura_id);
+  },
+  'recorrencias.listar': (p, { S }) => S.recorrencias.map(({ gerados, ...r }) => ({ ...r, proxima: (ocorrencias(r, addDays(T, 800)).find((d) => d >= T) || null) })),
+  'recorrencias.salvar': (p, { S }) => {
+    if (p.id) { const r = S.recorrencias.find((x) => x.id === p.id) || fail('Recorrência não encontrada.'); ['descricao', 'valor', 'data_final', 'status'].forEach((k) => { if (p[k] !== undefined) r[k] = p[k]; }); if (p.cobranca_banco !== undefined) { if (p.cobranca_banco && !(r.tipo_lancamento === 'SAIDA' && (recOf(S, r.recurso_id) || {}).tipo === 'CONTA')) fail('"Cobrança do banco" vale só para saída de conta.'); r.cobranca_banco = !!p.cobranca_banco; } r.versao++; return r; }
+    if (!String(p.descricao || '').trim()) fail('Informe a descrição.');
+    if (!(r2(p.valor) > 0)) fail('Informe o valor.');
+    if (!p.recurso_id) fail('Escolha a conta.');
+    if (p.tipo_lancamento === 'TRANSFERENCIA' && (!p.recurso_destino_id || p.recurso_destino_id === p.recurso_id)) fail('Escolha um destino diferente da origem.');
+    const r = { id: nid('rc'), tipo_lancamento: p.tipo_lancamento, descricao: p.descricao.trim(), valor: r2(p.valor), periodicidade: p.periodicidade || 'MENSAL', intervalo: p.intervalo || null, data_inicial: p.data_inicial || T, data_final: p.data_final || null, recurso_id: p.recurso_id, recurso_destino_id: p.recurso_destino_id || null, categoria_id: p.categoria_id || null, status: 'ATIVA', gerados: [], versao: 1, cobranca_banco: !!p.cobranca_banco };
+    if (r.cobranca_banco && !(r.tipo_lancamento === 'SAIDA' && (recOf(S, r.recurso_id) || {}).tipo === 'CONTA')) fail('"Cobrança do banco" vale só para saída de conta.');
+    S.recorrencias.push(r); return r;
+  },
+  'recorrencias.gerar': ({ ate }, { S }) => ({ criadas: gerarRec(S, ate || addDays(T, 35)) }),
+  'planejamentos.salvar': (p, { S }) => {
+    if (!String(p.nome || '').trim()) fail('Dê um nome ao planejamento.');
+    let pl = p.id && S.planejamentos.find((x) => x.id === p.id);
+    if (p.id && !pl) fail('Planejamento não encontrado.');
+    const tipo = pl ? (pl.tipo || 'SAIDA') : (p.tipo === 'ENTRADA' ? 'ENTRADA' : 'SAIDA');
+    if (pl && p.tipo && p.tipo !== tipo) fail('O tipo do planejamento não pode ser alterado.');
+    if (!(r2(p.valor_limite) > 0)) fail(tipo === 'ENTRADA' ? 'Informe a meta.' : 'Informe o limite.');
+    if (!p.categorias || !p.categorias.length) fail('Escolha ao menos uma categoria.');
+    const ct = tipo === 'ENTRADA' ? 'RECEITA' : 'DESPESA';
+    for (const c of p.categorias) {
+      const k = S.categorias.find((x) => x.id === c.categoria_id);
+      if (!k) fail('Categoria não encontrada.');
+      if (k.tipo !== ct) fail(tipo === 'ENTRADA' ? 'A categoria "' + k.nome + '" é de despesa. Planejamento de entrada aceita só categorias de receita.' : 'A categoria "' + k.nome + '" é de receita. Planejamento de gasto aceita só categorias de despesa.');
+    }
+    if (pl) checkVer(pl, p.versao);
+    let rc;
+    if (p.recorrencia !== undefined) {
+      if (pl && pl.serie_id && S.planejamentos.some((x) => x.serie_id === pl.serie_id && x.id !== pl.id && x.data_inicio > pl.data_inicio)) fail('Só o período mais recente da série pode mudar a repetição.');
+      if (p.recorrencia === null) rc = null;
+      else {
+        const o = { ...((pl && pl.recorrencia) || {}), ...p.recorrencia };
+        if (!['MENSAL', 'ANUAL', 'SEMANAL', 'DIARIA', 'A_CADA_N_DIAS'].includes(o.periodicidade)) fail('Escolha de quanto em quanto tempo o planejamento se repete.');
+        const n = Math.max(1, Math.floor(Number(o.intervalo) || 1));
+        if (o.periodicidade === 'A_CADA_N_DIAS' && n < 2) fail('Informe a cada quantos dias.');
+        rc = { periodicidade: o.periodicidade, intervalo: n, ate: o.ate || null, status: ['ATIVA', 'PAUSADA', 'ENCERRADA'].includes(o.status) ? o.status : 'ATIVA' };
+      }
+    }
+    const ini = p.data_inicio || (pl && pl.data_inicio) || monthStart(T);
+    let fim = p.data_fim || null;
+    if (!pl && rc) fim = fimPeriodo(ini, rc);
+    if (rc && !fim) fail('Defina o fim do período para repetir.');
+    if (fim && fim < ini) fail('O fim precisa ser depois do início.');
+    if (rc && rc.ate && rc.ate < ini) fail('A data final da repetição precisa ser depois do início.');
+    const plAntes = pl ? { nome: pl.nome, valor_limite: String(pl.valor_limite) } : null;
+    if (!pl) { pl = { id: nid('pl'), versao: 0, tipo, serie_id: null, recorrencia: null }; S.planejamentos.push(pl); }
+    Object.assign(pl, { nome: p.nome.trim(), data_inicio: ini, data_fim: fim, valor_limite: r2(p.valor_limite), prioridade: p.prioridade || 1, status: p.status || 'ATIVO', categorias: p.categorias.map((c) => ({ categoria_id: c.categoria_id, valor_limite: r2(c.valor_limite) || null, percentual_execucao: c.percentual_execucao || 100 })) });
+    if (rc !== undefined) { pl.recorrencia = rc; if (rc && !pl.serie_id) pl.serie_id = pl.id; }
+    if (plAntes) { if (plAntes.nome !== pl.nome) histAdd(S, { id: pl.id, entidade: 'planejamento' }, 'nome', plAntes.nome, pl.nome); if (plAntes.valor_limite !== String(pl.valor_limite)) histAdd(S, { id: pl.id, entidade: 'planejamento' }, 'valor_limite', plAntes.valor_limite, String(pl.valor_limite)); }
+    pl.versao++;
+    return situacaoPlan(S, pl);
+  },
+  'planejamentos.listar': (p, { S }) => S.planejamentos.filter((x) => (!p.vigentes || vigenteP(x)) && (!p.serie_id || x.serie_id === p.serie_id)).map((x) => situacaoPlan(S, x)),
+  'planejamentos.situacao': ({ id }, { S }) => situacaoPlan(S, S.planejamentos.find((x) => x.id === id) || fail('Planejamento não encontrado.')),
+  'historico.listar': (p, { S }) => {
+    const lista = (S.historico || []).filter((x) => (!p.entidade_id || x.entidade_id === p.entidade_id) && (!p.entidade || x.entidade === p.entidade) && (!p.campo || x.campo === p.campo)
+      && (!p.usuario_id || x.usuario_id === p.usuario_id) && (!p.de || x.data.slice(0, 10) >= p.de) && (!p.ate || x.data.slice(0, 10) <= p.ate)).sort((a, b) => (a.data < b.data ? 1 : a.data > b.data ? -1 : 0));
+    const off = Math.max(0, Number(p.offset) || 0), lim = Math.min(200, Math.max(1, Number(p.limite) || 50));
+    return { total: lista.length, itens: lista.slice(off, off + lim).map((x) => histView(S, x)) };
+  },
+  'historico.serie': ({ entidade_id, campo }, { S }) => {
+    if (!entidade_id || !campo) fail('Informe o item e o campo.');
+    const ls = (S.historico || []).filter((x) => x.entidade_id === entidade_id && x.campo === campo).sort((a, b) => (a.data < b.data ? -1 : a.data > b.data ? 1 : 0));
+    const numv = (v) => (v !== '' && !isNaN(Number(v)) ? Number(v) : v), pontos = [];
+    if (ls.length && ls[0].valor_anterior !== '') { const r = recOf(S, entidade_id); pontos.push({ data: (r && r.data_criacao) || ls[0].data.slice(0, 10), valor: numv(ls[0].valor_anterior), usuario_nome: '' }); }
+    ls.forEach((x) => pontos.push({ data: x.data.slice(0, 10), valor: numv(x.valor_novo), usuario_nome: x.usuario_nome }));
+    return { entidade_id, campo, campo_rotulo: HIST_ROTULOS[campo] || campo, pontos, atual: pontos.length ? pontos[pontos.length - 1].valor : null };
+  },
+  'relatorios.painel': ({ de, ate }, { S }) => painel(S, de || monthStart(T), ate || monthEnd(T)),
+  'relatorios.saldos': ({ data }, { S }) => {
+    const d = data || T, contas = S.recursos.filter((r) => r.tipo !== 'CARTAO' && r.status !== 'INATIVO').map((r) => { const sa = saldo(S, r.id, { ate: d }); return { id: r.id, nome: r.nome, tipo: r.tipo, instituicao: r.instituicao, saldo_atual: sa, saldo_projetado: saldo(S, r.id, { proj: true }), ...contaSit(r, sa) }; });
+    const cartoes = S.recursos.filter((r) => r.tipo === 'CARTAO' && r.status !== 'INATIVO').map((r) => ({ id: r.id, ...situacaoCartao(S, r.id) }));
+    return { contas, cartoes, dinheiro_atual: r2(contas.reduce((s, c) => s + c.saldo_atual, 0)), patrimonio_liquido: r2(contas.reduce((s, c) => s + c.saldo_atual, 0) - cartoes.reduce((s, c) => s + c.limite_comprometido - c.credito_a_favor, 0)) };
+  },
+  'relatorios.resultado': ({ de, ate }, { S }) => {
+    de ||= monthStart(T); ate ||= monthEnd(T);
+    const pc = {}, rc = {}, lines = linhasConsumo(S, de, ate);
+    lines.forEach((l) => { const k = rootCat(S, l.categoria_id) || '_'; pc[k] = (pc[k] || 0) + l.valor; });
+    const rec = receitas(S, de, ate, rc), desp = r2(lines.reduce((s, l) => s + l.valor, 0)), enc = encargos(S, de, ate);
+    const lst = (o) => Object.entries(o).map(([id, v]) => ({ categoria_id: id === '_' ? null : id, nome: id === '_' ? 'Sem categoria' : S.categorias.find((c) => c.id === id).nome, valor: r2(v) })).sort((a, b) => b.valor - a.valor);
+    return { receitas: rec, despesas: desp, encargos_financeiros: enc, resultado: r2(rec - desp - enc), despesas_por_categoria: lst(pc), receitas_por_categoria: lst(rc) };
+  },
+  'relatorios.fluxo': ({ ate }, { S }) => fluxo(S, ate || addDays(T, 30)),
+  'relatorios.serie': ({ meses = 6, ate }, { S }) => {
+    const end = (ate || T).slice(0, 7), pontos = [];
+    for (let i = Math.min(36, meses) - 1; i >= 0; i--) {
+      const ym = ymAdd(end, -i), de = ym + '-01', a = monthEnd(de);
+      const rec = receitas(S, de, a), desp = r2(linhasConsumo(S, de, a).reduce((s, l) => s + l.valor, 0)), enc = encargos(S, de, a);
+      pontos.push({ mes: ym, receitas: rec, despesas: desp, encargos_financeiros: enc, resultado: r2(rec - desp - enc) });
+    }
+    const comD = pontos.filter((p) => p.despesas > 0);
+    return { pontos, media_despesas: r2(comD.reduce((s, p) => s + p.despesas, 0) / (comD.length || 1)) };
+  },
+  'integridade.verificar': () => [],
+  'produtos.listar': ({ texto, todos, offset = 0, limite = 50 }, { S }) => {
+    const ws = norm(texto).split(/\s+/).filter(Boolean);
+    const f = S.produtos.filter((p) => (todos || p.status !== 'INATIVO') && (!ws.length || ((hay) => ws.every((w) => hay.includes(w)))(norm(p.nome + ' ' + (p.marca || '') + ' ' + (p.gtin || ''))))).sort((a, b) => a.nome.localeCompare(b.nome));
+    return { total: f.length, itens: f.slice(offset, offset + limite).map((p) => viewProd(S, p)) };
+  },
+  // Índice para busca no aparelho. Sem "desde": todos os ativos. Com "desde": o que mudou (inclui INATIVO); reenviar o último é inofensivo.
+  'produtos.indice': ({ desde }, { S }) => {
+    const at = idxMarcar(S), ate = new Date().toISOString();
+    if (!desde) return { itens: S.produtos.filter((p) => p.status !== 'INATIVO').sort((a, b) => a.nome.localeCompare(b.nome)).map((p) => viewProd(S, p)), ate, completo: true };
+    return { itens: S.produtos.filter((p) => (at[p.id] || '') >= desde).map((p) => viewProd(S, p)), ate, completo: false };
+  },
+  'produtos.salvar': (p, { S }) => {
+    if (p.id) {
+      const x = prodOf(S, p.id) || fail('Produto não encontrado.'); checkVer(x, p.versao);
+      if (p.gtin && x.gtin && p.gtin !== x.gtin) fail('O código de barras não pode ser trocado.');
+      ['nome', 'marca', 'unidade', 'categoria_id', 'status'].forEach((k) => { if (p[k] !== undefined) x[k] = p[k]; });
+      if (p.tam_embalagem !== undefined) { if (p.tam_embalagem !== '' && p.tam_embalagem !== null && tamNum(p.tam_embalagem) === null) fail('Informe só o número do tamanho da embalagem (ex.: 500); a unidade é a escolhida no produto.'); x.tam_embalagem = tamNum(p.tam_embalagem) || 1; }
+      if (p.gtin && !x.gtin) x.gtin = p.gtin;
+      pacoteCampos(S, x, p);
+      x.versao++; return viewProd(S, x);
+    }
+    if (!String(p.nome || '').trim()) fail('Dê um nome ao produto.');
+    if (p.gtin && S.produtos.some((x) => x.gtin === p.gtin)) fail('Já existe um produto com este código de barras.');
+    const x = { id: nid('p'), nome: p.nome.trim(), marca: p.marca || null, gtin: p.gtin || null, unidade: p.unidade || 'UN', tam_embalagem: tamNum(p.tam_embalagem) || 1, categoria_id: p.categoria_id || null, status: 'ATIVO', versao: 1, global_id: p.gtin ? nid('g') : null, contem_id: null, contem_qtd: null };
+    pacoteCampos(S, x, p);
+    S.produtos.push(x); return viewProd(S, x);
+  },
+  'produtos.porGtin': ({ gtin: g }, { S }) => {
+    const p = S.produtos.find((x) => x.gtin === g);
+    if (p) return { origem: 'ESPACO', produto: viewProd(S, p) };
+    const c = DB.catalogo.find((x) => x.gtin === g);
+    return c ? { origem: 'CATALOGO', sugestao: c } : { origem: 'NENHUMA' };
+  },
+  'produtos.imagem.salvar': ({ produto_id, dados }, { S }) => {
+    const p = prodOf(S, produto_id) || fail('Produto não encontrado.');
+    if (!/^data:image\/(jpeg|png|webp);base64,/.test(dados || '')) fail('Use uma foto JPEG, PNG ou WebP.');
+    if (dados.length > 30000) fail('A foto ficou grande demais.');
+    DB.imagens[p.id] = dados;
+    const pub = !!(p.gtin && !DB.imagens['g:' + p.gtin]);
+    if (pub) DB.imagens['g:' + p.gtin] = dados;
+    return { ok: true, publicada_no_catalogo: pub };
+  },
+  'produtos.imagem.remover': ({ produto_id }) => { delete DB.imagens[produto_id]; return { ok: true }; },
+  'produtos.imagens': ({ ids = [] }, { S }) => Object.fromEntries(ids.map((id) => { const p = prodOf(S, id); const own = DB.imagens[id], cat = p && p.gtin && DB.imagens['g:' + p.gtin]; return [id, own ? { dados: own, fonte: 'ESPACO' } : cat ? { dados: cat, fonte: 'CATALOGO' } : null]; })),
+  'lojas.listar': (p, { S }) => S.lojas.filter((l) => l.status !== 'INATIVA'),
+  'lojas.salvar': (p, { S }) => {
+    if (p.id) { const l = S.lojas.find((x) => x.id === p.id) || fail('Loja não encontrada.'); ['nome', 'cnpj', 'cidade', 'uf', 'latitude', 'longitude'].forEach((k) => { if (p[k] !== undefined) l[k] = p[k]; }); l.versao++; return l; }
+    if (!String(p.nome || '').trim()) fail('Dê um nome à loja.');
+    const l = { id: nid('lj'), nome: p.nome.trim(), cnpj: (p.cnpj || '').replace(/\D/g, '') || null, cidade: p.cidade || null, uf: p.uf || null, latitude: p.latitude ?? null, longitude: p.longitude ?? null, status: 'ATIVA', versao: 1 };
+    S.lojas.push(l); return l;
+  },
+  'lojas.proximas': ({ latitude, longitude, raio_km = 10 }, { S }) => S.lojas.concat(DB.lojasGlobais).filter((l) => l.latitude != null).map((l) => ({ ...l, distancia_km: r2(hav(latitude, longitude, l.latitude, l.longitude)) })).filter((l) => l.distancia_km <= raio_km).sort((a, b) => a.distancia_km - b.distancia_km),
+  'precos.registrar': ({ produto_id, loja_id, preco, data, chave_nfce }, { S }) => {
+    if (!prodOf(S, produto_id)) fail('Produto não encontrado.');
+    if (!lojaOf(S, loja_id)) fail('Escolha a loja.');
+    if (!(r2(preco) > 0)) fail('Informe o preço.');
+    return registrarPreco(S, produto_id, loja_id, preco, data, 'manual', chave_nfce);
+  },
+  'precos.compartilhados': ({ produto_ids = [] }, { S }) => Object.fromEntries(produto_ids.map((id) => {
+    const p = prodOf(S, id);
+    const list = p && p.gtin ? DB.obs.filter((o) => o.gtin === p.gtin && !o.escondido && o.status !== 'rejeitado').sort((a, b) => (a.data < b.data ? 1 : -1)) : [];
+    return [id, list.map((o) => ({ observacao_id: o.observacao_id, loja: o.loja, preco: o.preco, data: o.data, idade_dias: diffDays(T, o.data), verificado: o.status === 'validado', status: o.status, origem: o.origem, confirmacoes: o.confirmacoes, minha: o.minha, meu_voto: o.meu_voto }))];
+  })),
+  'precos.confirmar': ({ id, tipo }) => {
+    const o = DB.obs.find((x) => x.observacao_id === id) || fail('Preço não encontrado.');
+    if (o.minha) fail('Você não pode votar no próprio preço.');
+    if (o.meu_voto) fail('Você já votou neste preço.');
+    if (!['confirmo', 'discordo'].includes(tipo)) fail('Voto inválido.');
+    o.meu_voto = tipo;
+    if (tipo === 'confirmo') { o.confirmacoes++; if (o.confirmacoes >= 2 && o.status === 'observado') o.status = 'validado'; } else o.discordancias++;
+    return { status: o.status, confirmacoes: o.confirmacoes, discordancias: o.discordancias };
+  },
+  'precos.historico': ({ produto_id, loja_id }, { S }) => S.precos.filter((x) => (!produto_id || x.produto_id === produto_id) && (!loja_id || x.loja_id === loja_id)).sort((a, b) => (a.data < b.data ? 1 : -1)).map((x) => ({ ...x, loja: (lojaOf(S, x.loja_id) || {}).nome || '', produto: (prodOf(S, x.produto_id) || {}).nome || '' })),
+  'precos.opcoes': ({ produto_id, loja_id }, { S }) => opcs(S).filter((o) => o.produto_id === produto_id && o.status !== 'INATIVO' && (!loja_id || !o.loja_id || o.loja_id === loja_id)).sort((a, b) => a.preco - b.preco).map((o) => opcView(S, o)),
+  'precos.opcoes.salvar': (p, { S }) => {
+    const val = (o) => {
+      if (p.rotulo !== undefined) { const r = String(p.rotulo || '').trim(); if (!r) fail('Dê um nome ao preço (ex.: Atacado).'); if (r.length > 30) fail('Nome do preço: até 30 letras.'); o.rotulo = r; }
+      if (p.preco !== undefined) { const v = Number(p.preco); if (!(v > 0)) fail('Informe o preço.'); o.preco = r2(v); }
+      if (p.loja_id !== undefined) { if (p.loja_id && !lojaOf(S, p.loja_id)) fail('Loja não encontrada.'); o.loja_id = p.loja_id || null; }
+      if (p.qtd_min !== undefined) { if (p.qtd_min === null || p.qtd_min === '') o.qtd_min = null; else { const q = Number(p.qtd_min); if (!Number.isInteger(q) || q < 2) fail('A partir de: um número inteiro a partir de 2.'); o.qtd_min = q; } }
+      if (p.status !== undefined) { if (!['ATIVO', 'INATIVO'].includes(p.status)) fail('Situação inválida.'); o.status = p.status; }
+    };
+    if (p.id) { const o = opcs(S).find((x) => x.id === p.id) || fail('Preço não encontrado.'); val(o); return opcView(S, o); }
+    if (!prodOf(S, p.produto_id)) fail('Produto não encontrado.');
+    if (p.rotulo === undefined) fail('Dê um nome ao preço (ex.: Atacado).');
+    if (p.preco === undefined) fail('Informe o preço.');
+    const o = { id: nid('op'), produto_id: p.produto_id, rotulo: '', preco: 0, loja_id: null, qtd_min: null, status: 'ATIVO' };
+    val(o); opcs(S).push(o); return opcView(S, o);
+  },
+  'precos.evolucao': ({ produto_id, loja_id }, { S }) => {
+    const pts = S.precos.filter((x) => x.produto_id === produto_id && (!loja_id || x.loja_id === loja_id)).sort((a, b) => (a.data < b.data ? -1 : 1)).map((x) => ({ data: x.data, preco: x.preco, loja: (lojaOf(S, x.loja_id) || {}).nome || '' }));
+    if (!pts.length) return { pontos: [], resumo: null };
+    const v = pts.map((p) => p.preco);
+    return { pontos: pts, resumo: { minimo: Math.min(...v), maximo: Math.max(...v), media: r2(v.reduce((s, x) => s + x, 0) / v.length), variacao_pct: r2((v[v.length - 1] / v[0] - 1) * 100) } };
+  },
+  'alertas.precos': ({ dias = 30, pct = 10 }, { S }) => {
+    const out = [];
+    for (const p of S.produtos) {
+      const u = ultimoPago(S, p.id);
+      if (!u || !p.gtin) continue;
+      const cands = DB.obs.filter((o) => o.gtin === p.gtin && !o.minha && !o.escondido && ['observado', 'validado'].includes(o.status) && diffDays(T, o.data) <= dias && o.preco <= u.preco * (1 - pct / 100)).sort((a, b) => a.preco - b.preco);
+      if (cands[0]) out.push({ produto: { id: p.id, nome: p.nome, marca: p.marca }, ultimo_pago: u.preco, preco_encontrado: cands[0].preco, loja: cands[0].loja.nome, cidade: cands[0].loja.cidade, queda_pct: Math.round((1 - cands[0].preco / u.preco) * 100), verificado: cands[0].status === 'validado' });
+    }
+    return out.sort((a, b) => b.queda_pct - a.queda_pct);
+  },
+  'reputacao.minha': (p, { S }) => ({ ...DB.reputacao, compartilhando: !!S.config.compartilhar_precos }),
+  'config.ler': (p, { S }) => S.config,
+  'config.salvar': (p, { S }) => { ['compartilhar_precos', 'custo_km', 'fator_rota', 'casa_latitude', 'casa_longitude'].forEach((k) => { if (p[k] !== undefined) S.config[k] = p[k]; }); return S.config; },
+  'deslocamento.ler': ({ todos }, { S }) => {
+    const d = deslOf(S), f = (x) => todos || ativoD(x);
+    return { enderecos: d.enderecos.filter(f), veiculos: d.veiculos.filter(f), combustiveis: combView(d), modos: d.modos.filter(f).map((m) => viewModo(d, m)),
+      tipos_modo: TIPOS_MODO, tipos_veiculo: TIPOS_VEIC, fator_rota: S.config.fator_rota || 1.3 };
+  },
+  'enderecos.salvar': (p, { S }) => {
+    const d = deslOf(S);
+    let e = p.id ? d.enderecos.find((x) => x.id === p.id) || fail('Endereço não encontrado.') : null;
+    const nome = String(p.nome ?? (e ? e.nome : '')).trim();
+    if (!nome) fail('Dê um nome ao endereço.');
+    const lat = numOr(p.latitude, e ? e.latitude : null), lng = numOr(p.longitude, e ? e.longitude : null);
+    if (lat == null || lng == null || !Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) fail('Marque o local do endereço: use onde você está, o mapa ou a busca.');
+    if (!e) { e = { id: nid('en'), status: 'ATIVO', padrao: false }; d.enderecos.push(e); }
+    Object.assign(e, { nome, latitude: lat, longitude: lng, endereco: p.endereco !== undefined ? String(p.endereco || '').trim() || null : e.endereco ?? null });
+    if (p.status === 'INATIVO' || p.status === 'ATIVO') e.status = p.status;
+    fixPadrao(d.enderecos, p.padrao && ativoD(e) ? e : null);
+    return e;
+  },
+  'veiculos.salvar': (p, { S }) => {
+    const d = deslOf(S);
+    let v = p.id ? d.veiculos.find((x) => x.id === p.id) || fail('Veículo não encontrado.') : null;
+    const nome = String(p.nome ?? (v ? v.nome : '')).trim(), tipo = p.tipo || (v && v.tipo), comb = p.combustivel || (v && v.combustivel);
+    if (!nome) fail('Dê um nome ao veículo.');
+    if (!TIPOS_VEIC.includes(tipo)) fail('Escolha se é carro, moto ou outro.');
+    if (!COMBS.some(([c]) => c === comb)) fail('Escolha o combustível.');
+    const consumo = numOr(p.consumo, v ? v.consumo : null);
+    if (consumo != null && !(consumo > 0)) fail('Informe um consumo maior que zero.');
+    const novo = !v, nomeAntes = v && v.nome;
+    if (!v) { v = { id: nid('ve'), status: 'ATIVO' }; d.veiculos.push(v); }
+    Object.assign(v, { nome, tipo, combustivel: comb, consumo: consumo ?? null });
+    if (p.status === 'INATIVO' || p.status === 'ATIVO') v.status = p.status;
+    const md = d.modos.filter((m) => m.tipo === 'VEICULO' && m.veiculo_id === v.id);
+    if (novo && p.criar_modo !== false) d.modos.push({ id: nid('mo'), nome, tipo: 'VEICULO', veiculo_id: v.id, tarifa: 0, custo_km: 0, padrao: false, status: 'ATIVO' });
+    md.forEach((m) => { if (m.nome === nomeAntes) m.nome = nome; if (p.status === 'INATIVO' || p.status === 'ATIVO') m.status = p.status; });
+    fixPadrao(d.modos, null);
+    return v;
+  },
+  'combustiveis.salvar': ({ combustivel, preco }, { S }) => {
+    const d = deslOf(S);
+    if (!COMBS.some(([c]) => c === combustivel)) fail('Combustível desconhecido.');
+    if (preco == null || preco === '') delete d.combustiveis[combustivel];
+    else { const n = Number(preco); if (!(n > 0)) fail('Informe um preço maior que zero.'); d.combustiveis[combustivel] = r2(n); }
+    return combView(d);
+  },
+  'modos.salvar': (p, { S }) => {
+    const d = deslOf(S);
+    let m = p.id ? d.modos.find((x) => x.id === p.id) || fail('Transporte não encontrado.') : null;
+    const tipo = p.tipo || (m && m.tipo);
+    if (!TIPOS_MODO.includes(tipo)) fail('Escolha o tipo de transporte.');
+    const nome = String(p.nome ?? (m ? m.nome : '')).trim();
+    if (!nome) fail('Dê um nome ao transporte.');
+    const inativando = p.status === 'INATIVO';
+    let veiculo_id = null, tarifa = 0, custo_km = 0;
+    if (tipo === 'VEICULO') { veiculo_id = p.veiculo_id || (m && m.veiculo_id); if (!inativando && !d.veiculos.some((v) => v.id === veiculo_id && ativoD(v))) fail('Escolha o veículo.'); }
+    if (['ONIBUS', 'APP', 'OUTRO'].includes(tipo)) { tarifa = r2(numOr(p.tarifa, m ? m.tarifa : 0)); if (tarifa < 0) fail('A tarifa não pode ser negativa.'); }
+    if (['APP', 'OUTRO'].includes(tipo)) { custo_km = Number(numOr(p.custo_km, m ? m.custo_km : 0)); if (custo_km < 0) fail('O valor por km não pode ser negativo.'); }
+    if (!inativando && tipo === 'ONIBUS' && !(tarifa > 0)) fail('Informe a tarifa do ônibus.');
+    if (!inativando && ['APP', 'OUTRO'].includes(tipo) && !(tarifa > 0) && !(custo_km > 0)) fail('Informe a tarifa ou o valor por km.');
+    if (!m) { m = { id: nid('mo'), status: 'ATIVO', padrao: false }; d.modos.push(m); }
+    Object.assign(m, { nome, tipo, veiculo_id, tarifa, custo_km });
+    if (p.status === 'INATIVO' || p.status === 'ATIVO') m.status = p.status;
+    fixPadrao(d.modos, p.padrao && ativoD(m) ? m : null);
+    return viewModo(d, m);
+  },
+  'denuncias.criar': ({ alvo_tipo, alvo_id, motivo }) => {
+    if (!['preco', 'produto', 'imagem', 'loja'].includes(alvo_tipo)) fail('Tipo de denúncia inválido.');
+    if (!String(motivo || '').trim()) fail('Conte rapidamente o motivo.');
+    const o = alvo_tipo === 'preco' && DB.obs.find((x) => x.observacao_id === alvo_id);
+    if (o && o.minha) fail('Você não pode denunciar o próprio preço.');
+    let d = DB.admin.denuncias.find((x) => x.alvo_id === alvo_id);
+    if (!d) { d = { alvo_tipo, alvo_id, resumo: o ? `Preço ${o.preco.toFixed(2).replace('.', ',')} · ${o.loja.nome}` : alvo_tipo + ' ' + alvo_id, pessoas: 0, motivos: [], status_atual: 'visivel' }; DB.admin.denuncias.push(d); }
+    if (d._minha) fail('Você já denunciou este conteúdo.');
+    d._minha = true; d.pessoas++; d.motivos.push(motivo.trim());
+    const esc = d.pessoas >= 3;
+    if (esc) { d.status_atual = 'em_revisao'; if (o) o.escondido = true; }
+    return { registrada: true, conteudo_escondido: esc };
+  },
+  'listas.listar': (p, { S }) => S.listas.filter((l) => l.status !== 'ARQUIVADA').map((l) => listaView(S, l)),
+  'listas.criar': ({ nome }, { S }) => { if (!String(nome || '').trim()) fail('Dê um nome à lista.'); const l = { id: nid('li'), nome: nome.trim(), status: 'ATIVA', criado_em: now(), atualizado_em: now() }; S.listas.push(l); return listaView(S, l); },
+  'listas.arquivar': ({ id }, { S }) => { const l = S.listas.find((x) => x.id === id) || fail('Lista não encontrada.'); l.status = 'ARQUIVADA'; S.sessoes.forEach((s) => { if (s.lista_id === id && s.status === 'ABERTA') s.status = 'CANCELADA'; }); return listaView(S, l); },
+  'listas.detalhe': ({ id, loja_id }, { S }) => {
+    const l = S.listas.find((x) => x.id === id) || fail('Lista não encontrada.');
+    let tot = 0, sem = 0, eco = 0;
+    const itens = S.listaItens.filter((i) => i.lista_id === id).map((i) => {
+      const p = i.produto_id && prodOf(S, i.produto_id);
+      const x = p ? precoItem(S, p.id, loja_id, i.quantidade) : null;
+      const sp = p && !i.comprado && x ? sugPacote(S, p.id, loja_id, i.quantidade, x.preco) : null;
+      if (!i.comprado) { if (x && x.preco != null) tot += x.preco * i.quantidade; else sem++; if (sp) eco += sp.economia; }
+      return { ...i, unidade: p ? p.unidade : 'UN', tem_imagem: p ? viewProd(S, p).tem_imagem : false, contem_qtd: p && p.contem_id ? p.contem_qtd : null,
+        preco_estimado: x ? x.preco : null, preco_fonte: x && x.preco != null ? (x.opcao ? 'MEU' : x.fonte) : null, preco_normal: x ? x.preco_normal : null,
+        opcao: x ? x.opcao : null, opcoes: x ? x.opcoes : [], dica: x ? x.dica : null, sugestao_pacote: sp };
+    });
+    return { ...listaView(S, l), loja_id: loja_id || null, itens, total_estimado: r2(tot), itens_sem_preco: sem, economia_pacotes: r2(eco) };
+  },
+  'listas.item.adicionar': ({ lista_id, produto_id, descricao, quantidade }, { S }) => {
+    const l = S.listas.find((x) => x.id === lista_id);
+    if (!l || l.status === 'ARQUIVADA') fail('Lista não encontrada.');
+    const p = produto_id && prodOf(S, produto_id);
+    if (produto_id && !p) fail('Produto não encontrado.');
+    if (!p && !String(descricao || '').trim()) fail('Informe o item.');
+    const q = Number(quantidade) || 1;
+    if (!(q > 0) || q > 9999) fail('Quantidade inválida.');
+    const ex = p ? S.listaItens.find((i) => i.lista_id === lista_id && i.produto_id === p.id && !i.comprado)
+      : S.listaItens.find((i) => i.lista_id === lista_id && !i.produto_id && !i.comprado && norm(i.descricao) === norm(descricao));
+    if (ex) { ex.quantidade = r2(ex.quantidade + q); return { ...ex, ja_existia: true, parecidos: p ? parecidosDe(S, lista_id, p, ex.id) : [] }; }
+    const it = { id: nid('lx'), lista_id, produto_id: p ? p.id : null, descricao: p ? p.nome : descricao.trim(), quantidade: q, comprado: false };
+    S.listaItens.push(it);
+    return { ...it, ja_existia: false, parecidos: p ? parecidosDe(S, lista_id, p, it.id) : [] };
+  },
+  'listas.item.atualizar': ({ id, quantidade, remover, comprado }, { S }) => {
+    const it = S.listaItens.find((i) => i.id === id) || fail('Item não encontrado.');
+    if (remover) { S.listaItens = S.listaItens.filter((i) => i !== it); return { ...it, removido: true }; }
+    if (quantidade != null) it.quantidade = Math.max(0.001, Number(quantidade));
+    if (comprado != null) it.comprado = !!comprado;
+    return it;
+  },
+  'listas.item.vincular': ({ id, produto_id }, { S }) => {
+    const it = S.listaItens.find((i) => i.id === id) || fail('Item não encontrado.');
+    const p = prodOf(S, produto_id);
+    if (!p || p.status === 'INATIVO') fail('Produto não encontrado.');
+    if (it.produto_id === p.id) return { ...it, unido: false };
+    const ex = S.listaItens.find((i) => i.lista_id === it.lista_id && i.produto_id === p.id && !i.comprado && i !== it);
+    let alvo = it;
+    if (ex) { ex.quantidade = Math.max(ex.quantidade, it.quantidade); S.listaItens = S.listaItens.filter((i) => i !== it); alvo = ex; }
+    else { it.produto_id = p.id; it.descricao = p.nome; }
+    S.sessoes.filter((s) => s.lista_id === it.lista_id && s.status === 'ABERTA').forEach((s) => {
+      s.itens.forEach((si) => { if (si.lista_item_id === it.id) { si.lista_item_id = alvo.id; si.produto_id = p.id; si.descricao = p.nome; } });
+      syncSess(S, s);
+    });
+    return { ...alvo, unido: !!ex };
+  },
+  'listas.item.usar_pacote': ({ id, pacote_id }, { S }) => {
+    const it = S.listaItens.find((i) => i.id === id) || fail('Item não encontrado.');
+    const pk = prodOf(S, pacote_id);
+    if (!pk || !it.produto_id || pk.contem_id !== it.produto_id) fail('Este pacote não contém o produto do item.');
+    const n = pk.contem_qtd, qp = Math.floor(it.quantidade / n);
+    if (qp < 1) fail('A quantidade ainda não chega a um pacote com ' + n + '.');
+    const resto = r2(it.quantidade - qp * n);
+    let alvo = S.listaItens.find((i) => i.lista_id === it.lista_id && i.produto_id === pk.id && !i.comprado);
+    if (alvo) alvo.quantidade = r2(alvo.quantidade + qp);
+    else { alvo = { id: nid('lx'), lista_id: it.lista_id, produto_id: pk.id, descricao: pk.nome, quantidade: qp, comprado: false }; S.listaItens.push(alvo); }
+    if (resto > 0) it.quantidade = resto; else S.listaItens = S.listaItens.filter((i) => i !== it);
+    S.sessoes.filter((s) => s.lista_id === it.lista_id && s.status === 'ABERTA').forEach((s) => {
+      // sem sobra: o item da compra (marcado ou não) passa a ser o pacote; com sobra, ele continua como as unidades avulsas
+      if (!(resto > 0)) s.itens.forEach((si) => { if (si.lista_item_id === it.id) Object.assign(si, { lista_item_id: alvo.id, produto_id: pk.id, descricao: pk.nome, unidade: pk.unidade, manual: false, rotulo: '' }); });
+      syncSess(S, s);
+    });
+    return { item: alvo, resto, resto_item: resto > 0 ? it : null };
+  },
+  'sessoes.iniciar': ({ lista_id, loja_id, recurso_id }, { S }) => {
+    const l = S.listas.find((x) => x.id === lista_id) || fail('Lista não encontrada.');
+    if (l.status === 'ARQUIVADA') fail('Esta lista foi arquivada.');
+    if (!lojaOf(S, loja_id)) fail('Escolha a loja.');
+    const ab = S.sessoes.find((s) => s.lista_id === l.id && s.status === 'ABERTA');
+    if (ab) { syncSess(S, ab); return sessaoView(S, ab); }
+    const s = { id: nid('se'), lista_id, loja_id, recurso_id: recurso_id || null, status: 'ABERTA', criado_em: now(), itens: [] };
+    S.sessoes.push(s); syncSess(S, s); return sessaoView(S, s);
+  },
+  'sessoes.listar': ({ lista_id, status }, { S }) => S.sessoes.filter((s) => (!lista_id || s.lista_id === lista_id) && (!status || s.status === status) && (s.status !== 'ABERTA' || (S.listas.find((l) => l.id === s.lista_id) || {}).status === 'ATIVA')).map((s) => { syncSess(S, s); return sessaoView(S, s); }),
+  'sessoes.detalhe': ({ id }, { S }) => { const s = S.sessoes.find((x) => x.id === id) || fail('Compra não encontrada.'); syncSess(S, s); return sessaoView(S, s); },
+  'sessoes.sincronizar': ({ id }, { S }) => { const s = S.sessoes.find((x) => x.id === id) || fail('Compra não encontrada.'); syncSess(S, s); return sessaoView(S, s); },
+  'sessoes.item.salvar': ({ id, preco_unitario, quantidade, marcado, categoria_id, opcao_id, rotulo }, { S }) => {
+    const s = S.sessoes.find((x) => x.itens.some((i) => i.id === id)) || fail('Item não encontrado.');
+    if (s.status !== 'ABERTA') fail('Esta compra já foi encerrada.');
+    const it = s.itens.find((i) => i.id === id);
+    if (opcao_id) {
+      const o = opcs(S).find((x) => x.id === opcao_id && x.produto_id === it.produto_id && x.status !== 'INATIVO' && (!x.loja_id || x.loja_id === s.loja_id)) || fail('Este preço não vale mais. Escolha outro.');
+      it.preco_unitario = o.preco; it.rotulo = o.rotulo; it.manual = true;
+    } else if (preco_unitario !== undefined) {
+      if (preco_unitario != null && !(Number(preco_unitario) > 0)) fail('Informe um preço maior que zero.');
+      it.preco_unitario = preco_unitario == null ? null : r2(preco_unitario); it.manual = preco_unitario != null;
+      const rt = String(rotulo || '').trim();
+      if (rt.length > 30) fail('Nome do preço: até 30 letras.');
+      if (rt && it.produto_id && it.preco_unitario > 0) {
+        const o = opcs(S).find((x) => x.produto_id === it.produto_id && x.status !== 'INATIVO' && norm(x.rotulo) === norm(rt) && (x.loja_id || null) === s.loja_id);
+        if (o) o.preco = it.preco_unitario; else opcs(S).push({ id: nid('op'), produto_id: it.produto_id, rotulo: rt, preco: it.preco_unitario, loja_id: s.loja_id, qtd_min: null, status: 'ATIVO' });
+      }
+      it.rotulo = rt;
+    }
+    if (quantidade !== undefined) {
+      it.quantidade = Math.max(0.001, Number(quantidade));
+      const li = S.listaItens.find((x) => x.id === it.lista_item_id);
+      if (li) li.quantidade = it.quantidade;
+      if (preco_unitario === undefined && !opcao_id) repreco(S, s, it);
+    }
+    if (marcado !== undefined) it.marcado = !!marcado;
+    if (categoria_id !== undefined) it.categoria_id = categoria_id;
+    return sessItemView(S, s, it);
+  },
+  'sessoes.item.adicionar': ({ sessao_id, produto_id, descricao, quantidade, preco_unitario }, { S }) => {
+    const s = S.sessoes.find((x) => x.id === sessao_id) || fail('Compra não encontrada.');
+    if (s.status !== 'ABERTA') fail('Esta compra já foi encerrada.');
+    const p = produto_id && prodOf(S, produto_id);
+    if (produto_id && !p) fail('Produto não encontrado.');
+    if (!p && !String(descricao || '').trim()) fail('Informe o item.');
+    const q = Number(quantidade) || 1;
+    syncSess(S, s);
+    const ex = p ? s.itens.find((i) => i.produto_id === p.id) : s.itens.find((i) => !i.produto_id && norm(i.descricao) === norm(descricao));
+    if (ex) {
+      if (ex.marcado) ex.quantidade = r2(ex.quantidade + q);
+      ex.marcado = true;
+      const li = S.listaItens.find((x) => x.id === ex.lista_item_id);
+      if (li) li.quantidade = ex.quantidade;
+      if (preco_unitario != null) { ex.preco_unitario = r2(preco_unitario); ex.manual = true; ex.rotulo = ''; } else repreco(S, s, ex);
+      return { ...sessItemView(S, s, ex), ja_existia: true, parecidos: p ? parecidosDe(S, s.lista_id, p, ex.lista_item_id) : [] };
+    }
+    const li = { id: nid('lx'), lista_id: s.lista_id, produto_id: p ? p.id : null, descricao: p ? p.nome : descricao.trim(), quantidade: q, comprado: false };
+    S.listaItens.push(li);
+    const it = sessItem(S, s, li);
+    it.marcado = true;
+    if (preco_unitario != null) { it.preco_unitario = r2(preco_unitario); it.manual = true; it.rotulo = ''; }
+    s.itens.push(it);
+    return { ...sessItemView(S, s, it), ja_existia: false, parecidos: p ? parecidosDe(S, s.lista_id, p, li.id) : [] };
+  },
+  'sessoes.concluir': (p, { S }) => {
+    const s = S.sessoes.find((x) => x.id === p.id) || fail('Compra não encontrada.');
+    if (s.status !== 'ABERTA') fail('Esta compra já foi encerrada.');
+    const its = s.itens.filter((i) => i.marcado);
+    if (!its.length) fail('Marque ao menos um item.');
+    if (its.some((i) => !(i.preco_unitario > 0))) fail('Informe o preço de todos os itens marcados.');
+    const loja = lojaOf(S, s.loja_id), rid = p.recurso_id || s.recurso_id || fail('Escolha como pagou.');
+    const itens = its.map((i) => ({ descricao: i.descricao, quantidade: i.quantidade, valor_unitario: i.preco_unitario, valor_total: r2(i.quantidade * i.preco_unitario), categoria_id: i.categoria_id, produto_id: i.produto_id }));
+    const l = criarLanc(S, { tipo: 'SAIDA', descricao: loja ? loja.nome : 'Compra', valor_bruto: r2(itens.reduce((x, i) => x + i.valor_total, 0)), descontos: p.descontos, acrescimos: p.acrescimos, encargos: p.encargos, parcelas: p.parcelas, data_evento: p.data || T, recurso_id: rid, categoria_id: 'c_merc', itens, status: 'EFETIVADO' });
+    its.forEach((i) => { if (i.produto_id) registrarPreco(S, i.produto_id, s.loja_id, i.preco_unitario, p.data || T, 'sessao', p.chave_nfce); if (i.lista_item_id) { const li = S.listaItens.find((x) => x.id === i.lista_item_id); if (li) li.comprado = true; } });
+    s.status = 'CONCLUIDA'; s.lancamento_id = l.id;
+    return { sessao: sessaoView(S, s), lancamento: viewL(S, l, true) };
+  },
+  'sessoes.cancelar': ({ id }, { S }) => { const s = S.sessoes.find((x) => x.id === id) || fail('Compra não encontrada.'); if (s.status !== 'ABERTA') fail('Esta compra já foi encerrada.'); s.status = 'CANCELADA'; return { status: s.status }; },
+  'comparacao.lista': (p, { S }) => comparar(S, p),
+  'nfce.interpretar': ({ entrada, texto }, { S }) => interpretar(S, entrada, texto),
+  'nfce.importar': (p, { S }) => {
+    if (p.chave && S.notas.some((n) => n.chave === p.chave)) fail('Não é possível importar: esta nota já foi importada.');
+    if (!p.itens || !p.itens.length) fail('A nota não tem itens.');
+    let loja = p.loja_id && lojaOf(S, p.loja_id);
+    if (!loja && p.loja) { const c = (p.loja.cnpj || '').replace(/\D/g, ''); loja = (c && S.lojas.find((l) => l.cnpj === c)) || R['lojas.salvar']({ nome: p.loja.nome || 'Loja', cnpj: c, cidade: p.loja.cidade, uf: p.loja.uf }, { S }); }
+    if (!loja) fail('Informe a loja.');
+    const itens = p.itens.map((i) => {
+      let pid = i.produto_id && prodOf(S, i.produto_id) ? i.produto_id : null;
+      if (!pid && i.criar) pid = R['produtos.salvar']({ nome: i.criar.nome || i.descricao, gtin: i.criar.gtin, categoria_id: i.criar.categoria_id, unidade: i.unidade }, { S }).id;
+      const cnpj = loja.cnpj; if (pid && cnpj && i.codigo) S.apelidos[cnpj + ':' + i.codigo] = pid;
+      const pr = prodOf(S, pid);
+      return { descricao: pr ? pr.nome : i.descricao, quantidade: i.quantidade, valor_unitario: i.preco_unitario, valor_total: r2(i.total != null ? i.total : i.quantidade * i.preco_unitario), produto_id: pid, categoria_id: (pr && pr.categoria_id) || 'c_merc' };
+    });
+    const bruto = r2(itens.reduce((s, i) => s + i.valor_total, 0)), tot = p.total != null ? r2(p.total) : bruto;
+    const l = criarLanc(S, { tipo: 'SAIDA', descricao: loja.nome, valor_bruto: bruto, descontos: tot < bruto ? r2(bruto - tot) : 0, acrescimos: tot > bruto ? r2(tot - bruto) : 0, data_evento: p.data || T, recurso_id: p.recurso_id, parcelas: p.parcelas, categoria_id: 'c_merc', itens, status: 'EFETIVADO' });
+    itens.forEach((i) => { if (i.produto_id) registrarPreco(S, i.produto_id, loja.id, i.valor_unitario, p.data || T, p.chave ? 'nfce' : 'manual', p.chave); });
+    const nota = { id: nid('nf'), chave: p.chave || null, lancamento_id: l.id }; S.notas.push(nota);
+    return { lancamento: viewL(S, l, true), nota_id: nota.id, loja_id: loja.id };
+  },
+  'admin.painel': () => ({ usuarios: 1284, usuarios_ativos: 1201, espacos: 1517, produtos_globais: 18432, lojas_globais: 2210, precos_observados: 96410, precos_validados: 61877, precos_suspeitos: DB.obs.filter((o) => o.status === 'suspeito').length, denuncias_abertas: DB.admin.denuncias.length, cadastro_aberto: DB.admin.cadastro_aberto }),
+  'admin.cadastro': ({ aberto }) => { DB.admin.cadastro_aberto = !!aberto; return { cadastro_aberto: DB.admin.cadastro_aberto }; },
+  'admin.usuario.ativo': ({ email, ativo }) => { if (email === DB.usuario.email) fail('Você não pode desativar a si mesmo.'); const u = DB.admin.usuarios.find((x) => x.email === email) || fail('Usuário não encontrado.'); u.ativo = !!ativo; return { email, ativo: u.ativo }; },
+  'admin.papel': ({ email, papel }) => { if (email === DB.usuario.email) fail('Você não pode mudar o próprio papel.'); const u = DB.admin.usuarios.find((x) => x.email === email) || fail('Usuário não encontrado.'); u.papel = papel; return { email, papel }; },
+  'admin.catalogo': () => ({ suspeitos: DB.obs.filter((o) => o.status === 'suspeito').map((o) => { const vs = DB.obs.filter((x) => x.gtin === o.gtin && x !== o).map((x) => x.preco).sort((a, b) => a - b); const p = PRODUTOS.find((x) => x[2] && gtin(x[2]) === o.gtin); return { id: o.observacao_id, produto: p ? p[0] : o.gtin, gtin: o.gtin, loja: o.loja.nome, cidade: o.loja.cidade, preco: o.preco, mediana: vs.length ? vs[Math.floor(vs.length / 2)] : null, data: o.data }; }), repetidos: DB.admin.repetidos, imagens: DB.admin.imagens, totais: { produtos: 18432, lojas: 2210, precos: DB.obs.length, suspeitos: DB.obs.filter((o) => o.status === 'suspeito').length } }),
+  'admin.preco.decidir': ({ id, decisao }) => { const o = DB.obs.find((x) => x.observacao_id === id) || fail('Preço não encontrado.'); o.status = decisao === 'validar' ? 'validado' : 'rejeitado'; return { id, status: o.status }; },
+  'admin.produto.mesclar': ({ de, para }) => { DB.admin.repetidos = DB.admin.repetidos.filter((g) => !g.itens.some((i) => i.id === de)); return { de, para, mesclado: true }; },
+  'admin.reputacao': ({ email, nivel }) => { const u = DB.admin.usuarios.find((x) => x.email === email) || fail('Usuário não encontrado.'); if (!['novo', 'confiavel', 'bloqueado'].includes(nivel)) fail('Nível inválido.'); u.nivel = nivel; return { email, nivel }; },
+  'admin.imagem': ({ gtin: g, ativa }) => { const i = DB.admin.imagens.find((x) => x.gtin === g); if (i) i.ativa = !!ativa; return { gtin: g, ativa: !!ativa }; },
+  'admin.denuncias': () => DB.admin.denuncias.map(({ _minha, ...d }) => d),
+  'admin.denuncia.decidir': ({ alvo_tipo, alvo_id, decisao, bloquear_autor }) => {
+    const d = DB.admin.denuncias.find((x) => x.alvo_id === alvo_id && x.alvo_tipo === alvo_tipo) || fail('Denúncia não encontrada.');
+    DB.admin.denuncias = DB.admin.denuncias.filter((x) => x !== d);
+    const o = alvo_tipo === 'preco' && DB.obs.find((x) => x.observacao_id === alvo_id);
+    if (o) { if (decisao === 'procedente') o.status = 'rejeitado'; else o.escondido = false; }
+    return { alvo_tipo, alvo_id, decisao, autor_bloqueado: !!(decisao === 'procedente' && bloquear_autor) };
+  },
+  'admin.renomear': ({ alvo_tipo, alvo_id, nome }) => { if (!String(nome || '').trim()) fail('Informe o nome.'); return { alvo_tipo, alvo_id, nome: nome.trim() }; },
+};
+function checkVer(rec, v) {
+  if (v != null && flags.conflito) { flags.conflito = false; sset(FK, flags); rec.versao++; fail('Outra pessoa alterou este registro. Recarregue e tente de novo.', 'CONFLITO'); }
+  if (v != null && Number(v) !== rec.versao) fail('Outra pessoa alterou este registro. Recarregue e tente de novo.', 'CONFLITO');
+}
+function estornar(S, l, motivo, data, seed) {
+  if (l.status !== 'EFETIVADO') fail('Só lançamentos efetivados podem ser estornados.');
+  if (['ESTORNO', 'SALDO_INICIAL', 'PAGAMENTO_FATURA'].includes(l.origem)) fail('Este lançamento não pode ser estornado.');
+  if (!String(motivo || '').trim()) fail('Conte o motivo do estorno.');
+  const inv = { ENTRADA: 'SAIDA', SAIDA: 'ENTRADA', TRANSFERENCIA: 'TRANSFERENCIA' }[l.tipo];
+  const d = data || T;
+  const e = criarLanc(S, { tipo: inv, descricao: 'Estorno · ' + l.descricao, valor_bruto: l.valor_total, data_evento: d, status: 'EFETIVADO', recurso_id: l.recurso_id, origem_id: l.destino_id, destino_id: l.origem_id, categoria_id: l.categoria_id }, { origem: 'ESTORNO', seed });
+  const k = recOf(S, l.recurso_id);
+  if (k && k.tipo === 'CARTAO' && l.parcelas.length) {
+    let faturado = 0;
+    const fs = faturasDe(S, k.id);
+    l.parcelas.forEach((p) => { const f = fs.find((x) => x.id === p.fatura_id); if (!f || f.status === 'ABERTA') p.status = 'CANCELADA'; else faturado += p.valor; });
+    if (faturado > 0) e.parcelas = [{ id: nid('pc'), numero: 1, total: 1, valor: -r2(faturado), fatura_id: `${k.id}~${faturaYm(k, T, true)}`, status: 'ATIVA' }];
+  }
+  if (!seed) chequeConferir(S, e);
+  e.estorno_de = l.id;
+  l.status = 'ESTORNADO'; l.estornado_por = e.id; l.motivo_estorno = motivo.trim(); l.versao++;
+  if (!seed) audit(S, l.id, 'estornado', { motivo: ['', motivo.trim()] });
+  return e;
+}
+
+// ---------- cheque especial, rendimento e histórico de configuração ----------
+const dBR = (s) => s.slice(8, 10) + '/' + s.slice(5, 7) + '/' + s.slice(0, 4);
+const moeda = (v) => 'R$ ' + r2(v).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const taxaMensal = (v, u) => { const t = Number(v) || 0; if (t <= 0) return 0; return u === 'ANO' ? Math.pow(1 + t / 100, 1 / 12) - 1 : t / 100; };
+const cobrancaOk = (S, l) => l.tipo === 'SAIDA' && (recOf(S, l.recurso_id) || {}).tipo === 'CONTA';
+function contaCampos(r, p) {
+  ['taxa_rendimento', 'juros_cheque'].forEach((k) => { if (p[k] === undefined) return; const v = Number(p[k] === null || p[k] === '' ? 0 : p[k]); if (!(v >= 0 && v <= 1000)) fail('Taxa inválida (0 a 1000%).'); r[k] = v; });
+  ['rendimento_unidade', 'juros_cheque_unidade'].forEach((k) => { if (p[k] === undefined) return; const u = String(p[k] || '').toUpperCase(); if (u && !['MES', 'ANO'].includes(u)) fail('Unidade da taxa inválida (MES ou ANO).'); r[k] = u || 'MES'; });
+  if (p.limite_cheque !== undefined) {
+    if (p.limite_cheque === null || p.limite_cheque === '') { r.cheque_especial = false; r.limite_cheque = null; }
+    else { const l = Number(p.limite_cheque); if (!(l >= 0)) fail('Limite do cheque especial inválido.'); r.cheque_especial = true; r.limite_cheque = r2(l); }
+  }
+}
+function contaSit(r, sal) {
+  const out = { cheque_especial: null, rendimento_estimado_mes: null };
+  if (r.tipo !== 'CONTA') return out;
+  if (r.cheque_especial) {
+    const lim = r2(r.limite_cheque), emUso = r2(Math.max(0, -sal)), taxa = taxaMensal(r.juros_cheque, r.juros_cheque_unidade);
+    out.cheque_especial = { limite: lim, em_uso: r2(Math.min(emUso, lim)), limite_disponivel: r2(Math.max(0, lim - emUso)), disponivel_para_usar: r2(Math.max(0, sal + lim)),
+      uso_pct: lim > 0 ? Math.round(Math.min(emUso, lim) / lim * 1000) / 10 : 0, acima_do_limite: sal < -lim - 0.004, excesso: r2(Math.max(0, -sal - lim)),
+      juros_estimados_mes: r2(emUso * taxa), juros: Number(r.juros_cheque) || 0, juros_unidade: r.juros_cheque_unidade || '' };
+  }
+  const tr = taxaMensal(r.taxa_rendimento, r.rendimento_unidade);
+  if (tr > 0 && sal > 0) out.rendimento_estimado_mes = r2(sal * tr);
+  return out;
+}
+/* Como o banco: bloqueia a saída efetivada que deixa a conta abaixo de −limite (exceto cobrança do banco). Conferência pela linha do tempo. */
+function chequeConferir(S, l) {
+  if (!l || l.status !== 'EFETIVADO' || l.cobranca_banco || l.origem === 'SALDO_INICIAL') return;
+  for (const m of l.movimentacoes) {
+    if (m.natureza !== 'DEBITO' || !m.data_efetivacao) continue;
+    const r = recOf(S, m.recurso_id);
+    if (!r || r.tipo !== 'CONTA' || !r.cheque_especial) continue;
+    const lim = r2(r.limite_cheque), datas = [m.data_efetivacao].concat(T > m.data_efetivacao ? [T] : []);
+    for (const dt of datas) {
+      const com = saldo(S, r.id, { ate: dt }), sem = r2(com + m.valor);
+      if (com < -lim - 0.004 && (dt === m.data_efetivacao || sem >= -lim - 0.004)) fail('Saldo + limite insuficientes na conta "' + r.nome + '" em ' + dBR(dt) + ': faltam ' + moeda(-lim - com) + '. Se for uma cobrança do próprio banco (juros, tarifa), marque "cobrança do banco".', 'LIMITE_CONTA');
+    }
+  }
+}
+const HIST_CAMPOS = ['nome', 'instituicao', 'agencia', 'numero', 'tipo_conta', 'limite', 'dia_fechamento', 'dia_vencimento', 'bandeira', 'final', 'regra_fechamento', 'recurso_pagamento_id', 'anuidade', 'taxa_juros',
+  'taxa_rendimento', 'rendimento_unidade', 'cheque_especial', 'limite_cheque', 'juros_cheque', 'juros_cheque_unidade'];
+const HIST_ROTULOS = { nome: 'Nome', status: 'Situação', limite: 'Limite', limite_cheque: 'Limite do cheque especial', cheque_especial: 'Controle do cheque especial', juros_cheque: 'Juros do cheque especial',
+  juros_cheque_unidade: 'Unidade dos juros', taxa_rendimento: 'Taxa de rendimento', rendimento_unidade: 'Unidade do rendimento', tipo_conta: 'Tipo de conta', instituicao: 'Instituição', agencia: 'Agência', numero: 'Número',
+  bandeira: 'Bandeira', final: 'Final do cartão', dia_fechamento: 'Dia de fechamento', dia_vencimento: 'Dia de vencimento', regra_fechamento: 'Regra de fechamento', anuidade: 'Anuidade', taxa_juros: 'Juros do cartão',
+  recurso_pagamento_id: 'Conta de pagamento', valor_limite: 'Limite/meta', valor: 'Valor', descricao: 'Descrição', cobranca_banco: 'Cobrança do banco' };
+const entOf = (r) => r.entidade || { CONTA: 'conta', CARTAO: 'cartao', CARTEIRA: 'carteira' }[r.tipo] || 'recurso';
+function histVal(r, k) {
+  if (k === 'cheque_especial') return r.tipo === 'CONTA' && r.cheque_especial ? 'SIM' : '';
+  if (k === 'limite_cheque') return r.cheque_especial ? String(r2(r.limite_cheque)) : '';
+  return r[k] == null ? '' : String(r[k]);
+}
+function histAdd(S, r, campo, ant, novo, quem = DB.usuario, data = now()) {
+  (S.historico ||= []).push({ id: nid('hc'), entidade: entOf(r), entidade_id: r.id, campo, valor_anterior: ant, valor_novo: novo, usuario_id: quem.id, usuario_nome: quem.nome || quem.email, data });
+}
+function histView(S, x) {
+  const nome = x.entidade === 'planejamento' ? (S.planejamentos.find((p) => p.id === x.entidade_id) || {}).nome : x.entidade === 'categoria' ? (S.categorias.find((c) => c.id === x.entidade_id) || {}).nome
+    : x.entidade === 'recorrencia' ? (S.recorrencias.find((c) => c.id === x.entidade_id) || {}).descricao : (recOf(S, x.entidade_id) || {}).nome;
+  return { ...x, entidade_nome: nome || '', campo_rotulo: HIST_ROTULOS[x.campo] || x.campo };
+}
+
+export async function handle(action, p) {
+  if (!DB) seed();
+  const [a, b] = flags.lento ? [1000, 3000] : (window.NEXORA_CONFIG || {}).latenciaDemo || [300, 1100];
+  const write = !/listar|detalhe|historico|situacao|relatorios|bootstrap|porGtin|imagens|proximas|compartilhados|evolucao|alertas|minha|ler|interpretar|painel|catalogo|contar|recebidos|enviados|preferencias$|denuncias$|cpf$|opcoes$|indice$/.test(action);
+  await sleep(a + Math.random() * (b - a) * (write ? 1.6 : 1) + (flags.lento && write ? 2000 : 0));
+  if (flags.offline || !navigator.onLine) throw new TypeError('offline');
+  if (flags.falhar) { flags.falhar = false; sset(FK, flags); throw new TypeError('falha simulada'); }
+  const pub = ['auth.pedir', 'auth.confirmar'].includes(action);
+  if (!pub && (!p._tk || flags.expirar)) return { ok: false, error: 'Sua sessão terminou. Entre de novo.', codigo: 'LOGIN' };
+  if (flags.semBanco && action !== 'sistema.iniciar' && !pub) return { ok: false, error: 'O banco de dados ainda não foi criado.', codigo: 'SEM_BANCO' };
+  if (p._rid && DB.rids[p._rid]) return { ...clone(DB.rids[p._rid]), replay: true };
+  let S = DB.spaces.find((s) => s.id === p._ws) || DB.spaces[0];
+  if (flags.contaNova) S = null;
+  const SEM_ESPACO_OK = ['ws.criar', 'ws.listar', 'perfil.ler', 'perfil.cpf', 'perfil.salvar', 'convites.recebidos', 'convites.aceitar', 'convites.recusar', 'notificacoes.listar', 'notificacoes.contar', 'notificacoes.marcar_lida', 'notificacoes.preferencias', 'notificacoes.preferencias_salvar'];
+  if (!S && !pub && !SEM_ESPACO_OK.includes(action)) return { ok: false, error: 'Você ainda não tem um espaço.', codigo: 'SEM_ESPACO' };
+  const fn = R[action];
+  if (!fn) return { ok: false, error: 'Ação desconhecida.', codigo: '' };
+  if (action.startsWith('admin.') && DB.usuario.papel_plataforma !== 'admin') return { ok: false, error: 'Acesso restrito à administração.', codigo: '' };
+  if (S && !pub) {
+    const need = ADMIN_WS.has(action) ? 'admin' : write && !LEITURA_WRITES.has(action) && !action.startsWith('admin.') && action !== 'sistema.iniciar' ? 'editor' : 'leitura';
+    if (RANK[S.papel] < RANK[need]) return { ok: false, error: need === 'admin' ? 'Só quem administra o espaço pode fazer isso.' : 'Seu papel neste espaço é só de leitura.', codigo: '' };
+  }
+  let res;
+  const snap = write ? JSON.stringify(DB) : null;
+  try { res = { ok: true, data: clone(fn(p, { S })) }; } catch (e) { if (snap) DB = JSON.parse(snap); res = { ok: false, error: e.message, codigo: e.codigo || '' }; }
+  if (res.ok && p._rid && action !== 'perfil.cpf') DB.rids[p._rid] = res;
+  if (write) save();
+  return res;
+}
